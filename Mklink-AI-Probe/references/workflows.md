@@ -56,8 +56,42 @@ python -m mklink rtt
 
 ## 错误处理
 
+### Web GUI 导入 Pack 后仍找不到 SVD
+
+1. 先区分“Pack/SVD 可解析”和“当前运行实例已刷新”。读取
+   `%LOCALAPPDATA%\MKLink\pyocd\state.json`，确认 Pack 已登记且归档仍存在；再请求
+   `/api/health` 取得实际 `backend_port`，并请求
+   `/api/dash/superwatch/peripherals/targets?q=<器件前缀>`。离线解析成功不能证明运行
+   实例的目录已经更新。
+2. Pack 已登记、离线发现有目标，但运行接口仍返回 0 个目标时，优先怀疑旧的内存
+   目录或孤立的 `python -m mklink serve`。关闭/重开浏览器页面不等于 Python 后端
+   已退出；检查进程创建时间和父进程，不要反复导入同一 Pack。
+3. 只按监听端口定位后端并核对命令行，禁止按进程名清除所有 `python.exe`：
+
+   ```powershell
+   $listener = Get-NetTCPConnection -State Listen -LocalPort <PORT>
+   $backend = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)"
+   $backend | Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine
+   ```
+
+   只有命令行确认包含 `-m mklink serve` 且端口与 `/api/health` 一致时，才处理该
+   PID。服务仍响应时先停止 SuperWatch/RTT/SystemView 等活动流并调用设备断开；保存
+   原启动参数后再终止精确 PID，确认端口已释放，然后由原桌面入口或原命令重新启动。
+4. 新实例启动后再次检查 `/api/health` 和 targets 接口。设备连接响应若含
+   `target_initializing: true`，等待 `/api/device/status` 进入 `READY` 后再选 SVD；
+   初始化期间的选择可能被后续初始化覆盖。状态为 `DUMP_STREAM` 或 SuperWatch 为
+   `running` 时，必须先调用 `/api/dash/superwatch/stop`，否则不能切换外设芯片。
+5. 使用 PDSC 中的精确器件名搜索，例如 `APM32E103RC`，不要把完整订货号直接当作
+   Pack 器件名。选择后核对返回的 `selection.pack`、`selection.svd` 和非零
+   `items`。SVD 无需 AXF，但开始读取寄存器前，所选 SVD 必须与实际目标芯片一致。
+
+本次验证基线：`Geehy.APM32E1xx_DFP@1.0.4` 对 `APM32E1` 返回 8 个型号，使用
+`SVD/APM32E103xx.svd`，可生成 6077 个外设寄存器/字段项。若这些离线事实成立而运行
+接口为空，应处理运行实例和缓存，不应修改厂商 Pack。
+
 | 场景 | 处理方式 |
 |------|----------|
+| Pack 已导入但 SVD 型号列表为空 | 按上面的 Web GUI/SVD 流程核对实际端口、孤立 Python 后端、目录缓存和活动 SuperWatch 流 |
 | COM 口不存在 | `python -m mklink discover` 查找端口 |
 | IDCODE 无效 | 检查 SWD 接线和目标板供电 |
 | 新 MCU 未知 / profile 缺失 | 先按内置 Pack、内置 DAPLink FLM、已安装 Pack、自定义 FLM 顺序解析；仍无匹配时运行 `python -m mklink mcu-detect`，多候选再选择内部 Flash FLM 固化 |
