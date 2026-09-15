@@ -8,4 +8,5 @@
 /Mklink-AI-Probe/*.egg-info/
 /Mklink-AI-Probe/_maintainer/local/builtin_flm/
 /.mklink/
+/jt-220-oh/
 /.vscode/
