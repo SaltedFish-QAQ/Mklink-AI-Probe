@@ -10,6 +10,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 
+if (-not $BuildRoot -and $env:MKLINK_BUILD_ROOT) {
+    $BuildRoot = $env:MKLINK_BUILD_ROOT
+}
 if (-not $BuildRoot) {
     $commonDir = git -C $PSScriptRoot rev-parse --path-format=absolute --git-common-dir
     if ($LASTEXITCODE -ne 0) { throw 'A Git source checkout is required.' }
@@ -97,9 +100,28 @@ try {
         Push-Location -LiteralPath $WorkingDirectory
         try {
             Write-Output "Build storage: $BuildRoot"
-            & $Executable @ArgumentList 2>&1 | Tee-Object -FilePath (Join-Path $reportsRoot ($runName + '.log'))
-            $exitCode = $LASTEXITCODE
-            if ($null -eq $exitCode) { $exitCode = 0 }
+            # Windows PowerShell converts native stderr records into
+            # NativeCommandError objects.  With the script-wide Stop policy,
+            # harmless diagnostics from Vite, Tauri, Cargo, and npm used to
+            # abort the launcher before their real process exit code could be
+            # observed.  Keep logging both streams, but let the native exit
+            # code remain the verdict for this narrowly scoped invocation.
+            $savedErrorActionPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                & $Executable @ArgumentList 2>&1 | Tee-Object -FilePath (Join-Path $reportsRoot ($runName + '.log'))
+                $nativeExitCode = $LASTEXITCODE
+                $commandSucceeded = $?
+            } finally {
+                $ErrorActionPreference = $savedErrorActionPreference
+            }
+            if ($null -ne $nativeExitCode) {
+                $exitCode = $nativeExitCode
+            } elseif ($commandSucceeded) {
+                $exitCode = 0
+            } else {
+                $exitCode = 1
+            }
         } finally { Pop-Location }
     }
 } finally {
@@ -112,7 +134,14 @@ try {
             if (@(Get-ChildItem -LiteralPath $runDir -Recurse -Force -Attributes ReparsePoint).Count) {
                 Write-Warning "Temporary run contains test links; retained for safe inspection: $runDir"
             } else {
-                Remove-Item -LiteralPath $runDir -Recurse -Force
+                try {
+                    Remove-Item -LiteralPath $runDir -Recurse -Force -ErrorAction Stop
+                } catch {
+                    Write-Warning (
+                        "Temporary run cleanup failed; retained for safe inspection: " +
+                        "$runDir ($($_.Exception.Message))"
+                    )
+                }
             }
         }
     } finally { $lock.Dispose() }

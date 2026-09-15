@@ -891,6 +891,8 @@ def create_app(
     app.include_router(stream_api.create_stream_router(
         stream_registry, stream_types, auth_token,
     ))
+    from mklink.observe_bridge import install_stream_observation
+    install_stream_observation(app, stream_registry)
 
     from starlette.concurrency import run_in_threadpool
     from mklink.remote import online_flash_api
@@ -1197,6 +1199,7 @@ def create_app(
         com_port: str | None = None
         mcu_key: str | None = None
         swd_clock: str | None = None
+        debug_speed: str | None = None
 
     @app.get("/api/config")
     async def get_config():
@@ -1208,8 +1211,19 @@ def create_app(
         com_port: str | None = Body(default=None),
         mcu_key: str | None = Body(default=None),
         swd_clock: str | None = Body(default=None),
+        debug_speed: str | None = Body(default=None),
     ):
         config = load_config(_state["project_root"]) or {}
+        if debug_speed is not None:
+            from mklink.debug_speed import profile_clock
+            if debug_speed:
+                try:
+                    profile_clock(debug_speed)
+                except ValueError as error:
+                    raise HTTPException(status_code=422, detail=str(error)) from error
+                config["debug_speed"] = debug_speed
+            else:
+                config.pop("debug_speed", None)
         if com_port is not None:
             config["com_port"] = com_port
         if mcu_key is not None:
@@ -1222,12 +1236,23 @@ def create_app(
                     status_code=422,
                     detail="SWD 时钟必须是 1 Hz 到 10 MHz 之间的整数",
                 )
-            if parsed_swd_clock < 1 or parsed_swd_clock > 10_000_000:
+            from mklink.debug_speed import validate_clock_hz
+            try:
+                validate_clock_hz(parsed_swd_clock)
+            except ValueError as error:
                 raise HTTPException(
                     status_code=422,
-                    detail="SWD 时钟必须是 1 Hz 到 10 MHz 之间的整数",
-                )
+                    detail=str(error),
+                ) from error
             config["swd_clock"] = swd_clock
+            device = _state.get("device")
+            if device is not None and device.connected:
+                from mklink.flash import FlashError
+                try:
+                    async with _exclusive_probe_control("config-clock") as (device, _):
+                        await run_in_threadpool(device._flash.set_swd_clock, parsed_swd_clock)
+                except FlashError as error:
+                    raise HTTPException(status_code=422, detail=str(error)) from error
         save_config(_state["project_root"], config)
         return config
 
@@ -1608,15 +1633,27 @@ def create_app(
             )
 
         async with async_target_debug_lease(_state, "connect"):
+            device = None
             try:
                 device = await loop.run_in_executor(None, _connect)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-
-        _state["device"] = device
-        _state["dispatcher"] = DeviceDispatcher(device)
-        await run_in_threadpool(get_managers()["superwatch"].prepare, device)
-        remember_device_connection(_state, device, mcu=mcu)
+                await run_in_threadpool(get_managers()["superwatch"].prepare, device)
+                dispatcher = DeviceDispatcher(device)
+            except Exception as exc:
+                detail = str(exc)
+                if device is not None:
+                    try:
+                        await run_in_threadpool(device.close)
+                    except Exception as close_error:
+                        detail += f"; connection cleanup failed: {close_error}"
+                raise HTTPException(
+                    status_code=400 if isinstance(exc, ValueError) else 500,
+                    detail=detail,
+                ) from exc
+            # Publish only a fully prepared command session. A catalog/symbol
+            # failure must not leave an apparently connected 0x0 probe behind.
+            _state["device"] = device
+            _state["dispatcher"] = dispatcher
+            remember_device_connection(_state, device, mcu=mcu)
 
         async def _initialize_target_later():
             try:
@@ -1847,6 +1884,32 @@ def create_app(
         async with _exclusive_probe_control("reset") as (device, stopped):
             await run_in_threadpool(device.reset)
         return {"status": "ok", "stopped": stopped}
+
+    @app.post("/api/device/debug-speed")
+    async def set_debug_speed(profile: str = Body(..., embed=True)):
+        from mklink.debug_speed import profile_clock
+        try:
+            profile_clock(profile)
+            async with _exclusive_probe_control("debug-speed") as (device, stopped):
+                result = await run_in_threadpool(device.set_debug_speed, profile)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        config = load_config(_state["project_root"]) or {}
+        config["debug_speed"] = profile
+        save_config(_state["project_root"], config)
+        return {**result, "stopped": stopped}
+
+    @app.get("/api/device/debug-speed")
+    async def get_debug_speed():
+        from mklink.debug_speed import PROFILES
+        config = load_config(_state["project_root"]) or {}
+        profile = config.get("debug_speed", "medium")
+        device = _state.get("device")
+        hz = PROFILES.get(profile, PROFILES["medium"])
+        if device and device.connected:
+            hz = device._bridge._ctx.swd_clock_hz or hz
+            profile = next((name for name, value in PROFILES.items() if value == hz), None)
+        return {"profile": profile, "clock_hz": hz, "default": "medium", "profiles": PROFILES}
 
     @asynccontextmanager
     async def _exclusive_probe_control(operation: str):
@@ -3148,6 +3211,31 @@ def create_app(
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get("/api/device/configuration")
+    async def configuration_description(part_number: str, model: str = "V4"):
+        from mklink.device_configuration import describe_configuration
+
+        try:
+            return await run_in_threadpool(describe_configuration, part_number, model)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/device/configuration/read")
+    async def configuration_read(part_number: str = Body(...), model: str = Body("V4")):
+        from mklink.device_configuration import read_configuration
+
+        if not _state["device"] or not _state["device"].connected:
+            raise HTTPException(
+                status_code=400, detail="Connect the target device first"
+            )
+        async with async_target_debug_lease(_state, "configuration-read"):
+            try:
+                return await run_in_threadpool(
+                    read_configuration, _state["device"], part_number, model
+                )
+            except (ValueError, RuntimeError, OSError) as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+
     @app.post("/api/device/read-register")
     async def read_register(name: str = Body(..., embed=True)):
         if not _state["device"] or not _state["device"].connected:
@@ -3655,6 +3743,7 @@ def run_server(
         app = create_app(
             auth_token=auth_token,
             project_root=project_root,
+            desktop_instance_id=desktop_instance_id,
             backend_port=port,
         )
 
@@ -3698,7 +3787,27 @@ def run_server(
         except Exception as e:
             logger.warning("Auto-connect failed: %s", e)
 
+    from mklink.observe_bridge import configure_stream_observation
+
+    mklink_state = getattr(app.state, "mklink_state", {})
+    observation_token = (
+        auth_token
+        if auth_token is not None
+        else mklink_state.get("auth_token")
+    )
+    observation_correlation = (
+        desktop_instance_id
+        or mklink_state.get("desktop_instance_id")
+    )
+
     if desktop_port_end is None:
+        configure_stream_observation(
+            app,
+            host=host,
+            port=port,
+            auth_token=observation_token,
+            private_correlation=observation_correlation,
+        )
         set_backend_port(port)
         browser_sessions = getattr(app.state, "browser_sessions", None)
         if browser_sessions is None:
@@ -3718,6 +3827,13 @@ def run_server(
         host, port, desktop_port_end,
     )
     try:
+        configure_stream_observation(
+            app,
+            host=host,
+            port=selected_port,
+            auth_token=observation_token,
+            private_correlation=observation_correlation,
+        )
         set_backend_port(selected_port)
         _write_desktop_runtime_info(
             desktop_runtime_info,

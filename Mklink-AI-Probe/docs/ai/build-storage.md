@@ -1,11 +1,12 @@
 # 构建存储规则
 
-维护者已要求所有 MKLink 构建和测试临时内容集中到主工作区：
+所有 MKLink 构建和测试临时内容集中到一个专用目录。优先使用环境变量
+`MKLINK_BUILD_ROOT` 或 `scripts/build_workspace.ps1 -BuildRoot` 显式指定；
+未指定时使用 Git 主工作区旁的 `.build`。
 
-`E:\software\HPM5300\Mklink-AI-Probe\.build`
 
 `.build/` 已由 Git 忽略，禁止提交或上传 GitHub。工作树通过 Git common
-directory 找到主工作区，共享同一目录，不另建缓存。C 盘和 Windows 系统盘
+directory 找到主工作区，共享同一目录，不另建缓存。Windows 系统盘
 不能用作构建输出或临时目录；不修改系统级 TEMP，也不迁移已安装工具链。
 
 ## 目录用途

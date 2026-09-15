@@ -22,17 +22,40 @@ Paths below are relative to the source root containing this file and
 - Preserve unrelated user changes. Never infer authorization for merging
   `master`, signing, tags, releases, update pointers, or Gitee synchronization.
 
-## Continuous Prerelease Work
+## Shared Development And Publication
 
-- Use the active prerelease branch recorded in the handoff. Do not create an
-  issue branch/worktree, restart fixes from `master`, or develop on `master`.
-  A new release branch requires a maintainer request.
+- Canonical development/issue repository is `MicroKeen/Mklink-AI-Probe`, default
+  `main`, remote `microkeen`. See `docs/ai/repository-governance.md` for the live
+  branch rules and publisher boundary. Existing client update URLs are unchanged.
+- Start each authorized fix/feature from current `microkeen/main` in an isolated
+  `codex/<task>` branch/worktree, or continue its existing task branch. Push that
+  branch to `microkeen` and submit a PR. Never push directly to `main`.
+- `Aladdin-Wang` and `su5176` are the repository administrators and PR integrators.
+  Main requires another person's approval and the `feedback-contract` check;
+  neither administrator has a bypass of those gates. An AI must still obtain
+  explicit merge authorization, and must not weaken rules to complete a task.
+  Exception authorized on 2026-09-15: an explicitly authorized version release
+  may merge without a second person's approval after full release qualification
+  and a successful required CI check. For that release only, temporarily set
+  approval count to zero and disable last-push/additional approval requirements;
+  keep PR, CI, discussion-resolution and force-push rules active. Pin the exact
+  qualified PR head and restore/verify the original rules in a finally block,
+  whether merging succeeds or fails. Ordinary PRs retain the normal review gate.
+- Only `Aladdin-Wang` may update the `release` and `firmware` channels or official
+  `v*` / `firmware-assets` tags. Development authorization does not authorize a
+  publication, signing, credential change, or migration of client update URLs.
+- Authorized Issue automation follows `docs/ai/issue-maintenance.md`: use an
+  isolated `codex/issue-<number>` worktree from `microkeen/main`, push only that
+  branch to `microkeen`, and submit a PR plus test report for human review.
+  This is not permission to merge, publish, change credentials, or operate hardware.
+- Do not restart development from the legacy `master`. A source release branch
+  or a new publication requires a maintainer request.
 - Fetch the matching GitHub branch before editing; reconcile divergence without
   force pushes or rewriting shared history.
 - Finish each issue with the relevant checks, `git diff --check`, and an update
   to `docs/ai/project-memory.json`; run `python scripts/ai_memory.py render` and
   `python scripts/ai_memory.py validate`. Commit separately and promptly push
-  to the matching branch on GitHub `origin` under standing maintainer authority.
+  to the task branch on GitHub `microkeen` under standing maintainer authority.
   Verify the remote tip, report failures, and leave unrelated work untouched.
 
 ## Verification
@@ -42,8 +65,8 @@ Paths below are relative to the source root containing this file and
   physical hardware for device behavior. Documentation changes need document,
   link, packaging, or instruction-boundary checks, not unrelated hardware runs.
 - Before an authorized merge/release, run the full Python and GUI suites,
-  production build, and affected real-surface gates. Incorporate newer `master`
-  first; subsequent code changes invalidate earlier evidence. Verify the merged
+  production build, and affected real-surface gates. Reconcile current
+  `microkeen/main` first; subsequent code changes invalidate earlier evidence. Verify the merged
   tip and clean state. Missing required facilities need an explicit waiver.
 - Record environment failures and unverified behavior. Component tests or
   fixtures do not prove real installation/hardware success; a prerelease push
@@ -52,8 +75,8 @@ Paths below are relative to the source root containing this file and
 ## Storage And Product Constraints
 
 - Run build/test commands through `scripts/build_workspace.ps1`. All scratch
-  belongs in the main checkout's ignored `.build`, currently
-  `E:\software\HPM5300\Mklink-AI-Probe\.build`; never C: or the system drive.
+  belongs in `MKLINK_BUILD_ROOT` when configured, otherwise in the main
+  checkout's ignored `.build`; never use the Windows system drive.
   Reuse caches, clean per-run scratch, and never upload `.build` or local logs.
   Preserve tracked `gui/dist` and official `release` assets. Report inaccessible
   or linked cleanup paths for manual handling; do not force deletion.

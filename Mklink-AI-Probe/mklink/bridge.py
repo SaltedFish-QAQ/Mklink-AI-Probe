@@ -14,6 +14,9 @@ import time
 from collections.abc import Callable
 
 import serial
+from mklink._isolated_serial import IsolatedSerial
+import os
+import sys
 
 from mklink._types import (
     DEFAULT_BAUDRATE,
@@ -71,7 +74,7 @@ class MKLinkSerialBridge:
         self._port = port
         self._baudrate = baudrate
         self._port_lock = _PortLock(port)
-        self._serial: serial.Serial | None = None  # 延迟到 connect() 中打开
+        self._serial: serial.Serial | IsolatedSerial | None = None
         self._ctx = DeviceContext()
         self._reader_thread: threading.Thread | None = None
         self._running = False
@@ -116,7 +119,12 @@ class MKLinkSerialBridge:
             return False
 
         try:
-            self._serial = serial.Serial(self._port, self._baudrate, timeout=0.01)
+            # The bundled desktop/CLI/MCP Python runtime can pause all threads
+            # during GC or native parsing. Keep Windows CDC draining elsewhere.
+            isolated = (os.name == 'nt' and not getattr(sys, 'frozen', False)
+                        and getattr(serial.Serial, '__module__', '') == 'serial.serialwin32')
+            constructor = IsolatedSerial if isolated else serial.Serial
+            self._serial = constructor(self._port, self._baudrate, timeout=0.01)
         except serial.SerialException as e:
             self._port_lock.release()
             msg = str(e).lower()
@@ -504,20 +512,38 @@ class MKLinkSerialBridge:
             self._armed_prompt_prefix = b""
             self._armed_prompt_seen = False
 
-    def _enter_stream(self, state: DeviceState) -> None:
+    def _try_enter_stream(self, state: DeviceState) -> bool:
         """切换到流模式，并保留启动提示符之后已经到达的流字节。"""
         with self._buffer_lock:
+            if self._ctx.state is not DeviceState.READY:
+                return False
             pending = []
-            if self._armed_stream_state is state and self._armed_prompt_seen:
-                pending = list(self._armed_stream_tail)
+            armed_state = getattr(self, "_armed_stream_state", None)
+            prompt_seen = getattr(self, "_armed_prompt_seen", False)
+            armed_tail = getattr(self, "_armed_stream_tail", None)
+            if armed_state is state and prompt_seen and armed_tail is not None:
+                pending = list(armed_tail)
             self._response_buffer.clear()
             self._response_buffer.extend(pending)
             self._armed_stream_state = None
-            self._armed_stream_tail.clear()
+            if armed_tail is None:
+                self._armed_stream_tail = []
+            else:
+                armed_tail.clear()
             self._armed_prompt_prefix = b""
             self._armed_prompt_seen = False
             self._ctx.state = state
         self._utf8_decoder.reset()  # 新流会话从干净状态开始
+
+        return True
+
+    def _enter_stream(self, state: DeviceState) -> None:
+        """Atomically enter a stream without overwriting an active stream."""
+        if self._try_enter_stream(state):
+            return
+        raise RuntimeError(
+            f"cannot enter {state.value}; bridge state is {self._ctx.state.value}"
+        )
 
     def _capture_armed_stream_tail(self, data: bytes) -> bytes:
         """Capture raw bytes after the prompt and return command-mode bytes.

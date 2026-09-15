@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](https://python.org)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-FFC131?logo=tauri&logoColor=black)](https://tauri.app)
 [![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white)](https://vuejs.org)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Aladdin-Wang/Mklink-AI-Probe/blob/master/LICENSE)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/MicroKeen/Mklink-AI-Probe/blob/main/LICENSE)
 
 [English](#features) · [快速开始](#快速开始) · [命令速查](#命令速查) · [架构](#架构) · [安装与依赖](#安装与依赖)
 
@@ -16,6 +16,10 @@
 ---
 
 ## Features
+
+开发与反馈已转到 [MicroKeen/Mklink-AI-Probe](https://github.com/MicroKeen/Mklink-AI-Probe)。
+遇到疑似缺陷时，可让 AI 按[问题反馈](references/issue-reporting.md)整理并在授权后提交脱敏报告。
+现有安装包与自动更新仍使用原发布渠道；代码迁移不改变已安装版本的更新地址。
 
 | 功能 | 说明 |
 |------|------|
