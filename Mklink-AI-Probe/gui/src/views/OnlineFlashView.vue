@@ -70,7 +70,7 @@ const targetMemoryRegions = ref<TargetMemoryRegion[]>([])
 const targetMemoryMapBusy = ref(false)
 const security = ref<SecurityCapability>({ part_number: '', supported: false, unlock_supported: false, lock_supported: false, family: '', reason: tr('请选择已验证的目标器件', 'Select a hardware-validated target'), unlock_erases_flash: false, unlock_erases_eeprom: false, unlock_erases_backup_registers: false, reversible_lock: false })
 const desiredPart = ref(saved.targetPart ?? '')
-const targetQuery = ref('')
+const targetQuery = ref(saved.targetPart ?? '')
 const packStatus = ref<PackStatus | null>(null)
 const packBusy = ref(false)
 const packCancelPending = ref(false)
@@ -79,6 +79,7 @@ const packPhase = ref('preparing')
 const packError = ref('')
 const customFlms = ref<CustomFlmRecord[]>([])
 const flashAlgorithms = ref<FlashAlgorithmRecord[]>([])
+const selectedAlgorithmId = ref('')
 const customFlmBusy = ref(false)
 const customFlmError = ref('')
 const firmware = ref<File | null>(null)
@@ -110,6 +111,130 @@ const logs = ref<string[]>([])
 const lastSequence = ref(0)
 const streamDisconnected = ref(false)
 const creatingJob = ref(false)
+const pendingRequest = ref('')
+const recoveryBusy = ref(false)
+const recoveryMessage = ref('')
+const canEndTracking = ref(false)
+let recoveryGeneration = 0
+const recoveryBlocked = computed(() => !!pendingRequest.value || recoveryBusy.value || !!recoveryMessage.value)
+function pendingPrefix(probe = probeId.value): string {
+  return `mklink.onlineFlash.pending.${encodeURIComponent(probe)}.`
+}
+function loadPending(): void {
+  try {
+    pendingRequest.value = ''
+    for (let index = 0; index < localStorage.length; index++) {
+      const key = localStorage.key(index)
+      if (key?.startsWith(pendingPrefix())) {
+        pendingRequest.value = key.slice(pendingPrefix().length)
+        break
+      }
+    }
+  } catch {
+    recoveryMessage.value = tr('无法读取任务凭据，已禁止新提交。请恢复浏览器存储后刷新。', 'Cannot read task receipts. Restore browser storage and reload before submitting.')
+  }
+}
+let recoveryTimer: ReturnType<typeof setTimeout> | undefined
+async function recoverJob(): Promise<void> {
+  if (!pendingRequest.value || recoveryBusy.value) return
+  const requestId = pendingRequest.value
+  const probe = probeId.value
+  recoveryBusy.value = true
+  canEndTracking.value = false
+  const generation = recoveryGeneration
+  const current = () => !disposed && generation === recoveryGeneration && probe === probeId.value && requestId === pendingRequest.value
+  try {
+    const retained = await api.retainedJob(requestId)
+    if (!current()) return
+    if (!retained) {
+      canEndTracking.value = true
+      recoveryMessage.value = tr('未找到保留记录；这不代表未执行。请先检查目标状态。', 'No retained record; this does not prove it did not run. Inspect the target first.')
+      return
+    }
+    const snapshot = retained.result?.job
+    if (retained.state === 'succeeded' || retained.state === 'failed') {
+      if (snapshot) {
+        jobId.value = snapshot.job_id
+        jobState.value = snapshot.state
+        totalProgress.value = snapshot.total_progress
+      } else {
+        jobState.value = retained.state
+        if (retained.state === 'succeeded') totalProgress.value = 1
+      }
+      subscription?.close(); subscription = null
+      appendLog(`[JOB] ${requestId}: ${retained.state}${retained.error ? ` · ${retained.error}` : ''}`)
+      for (const error of retained.result?.acquisition?.errors ?? []) appendLog(tr(`[采集恢复失败] ${error}`, `[Capture restore failed] ${error}`))
+      localStorage.removeItem(pendingPrefix(probe) + requestId)
+      recoveryMessage.value = ''
+      loadPending()
+    } else if (retained.state === 'running' && retained.online_job_id) {
+      const snapshot = await api.getJob(retained.online_job_id)
+      if (!current()) return
+      const changed = jobId.value !== snapshot.job_id
+      const alreadyFinished = !changed && jobState.value !== null && TERMINAL.has(jobState.value)
+      jobId.value = snapshot.job_id
+      if (!alreadyFinished) { jobState.value = snapshot.state; totalProgress.value = snapshot.total_progress }
+      if (changed) lastSequence.value = 0
+      if (!alreadyFinished && !TERMINAL.has(snapshot.state) && (changed || !subscription)) subscribe(lastSequence.value)
+      recoveryMessage.value = tr('已关联原任务；完成后查询持久结果。', 'Original job attached; query its retained result after completion.')
+    } else {
+      canEndTracking.value = retained.state === 'unknown'
+      recoveryMessage.value = tr('任务结果尚未确认，请查询原任务并检查目标；不会自动重新提交。', 'Outcome is unconfirmed. Query the original job and inspect the target; no automatic resubmission.')
+    }
+    if (retained.state === 'running') {
+      clearTimeout(recoveryTimer)
+      recoveryTimer = setTimeout(() => { if (current()) void recoverJob() }, 750)
+    }
+  } catch (error) {
+    if (current()) recoveryMessage.value = message(error)
+  } finally { if (generation === recoveryGeneration) recoveryBusy.value = false }
+}
+async function endTracking(): Promise<void> {
+  if (!canEndTracking.value || recoveryBusy.value || creatingJob.value) return
+  const requestId = pendingRequest.value
+  const probe = probeId.value
+  const generation = recoveryGeneration
+  const current = () => !disposed && generation === recoveryGeneration && probe === probeId.value && requestId === pendingRequest.value
+  if (!await confirmRisk(tr(
+    '请先人工检查目标板和后台任务，确认没有仍在执行的操作。结束跟踪只移除本地请求凭据，不会停止、撤销或重试原操作。已完成检查并结束跟踪？',
+    'Inspect the target and backend jobs first and confirm no operation is still running. Ending tracking only removes this local receipt; it does not stop, undo or retry the operation. Confirm inspection and end tracking?',
+  )) || !current()) return
+  recoveryBusy.value = true
+  try {
+    // Recheck after confirmation; an unreachable backend is not a missing record.
+    const retained = await api.retainedJob(requestId)
+    if (!current()) return
+    if (retained && retained.state !== 'unknown') {
+      recoveryMessage.value = tr('后台记录已变化，请重新查询原任务。', 'The backend record changed. Query the original job again.')
+      canEndTracking.value = false
+      return
+    }
+    localStorage.removeItem(pendingPrefix(probe) + requestId)
+    subscription?.close(); subscription = null
+    jobId.value = ''; jobState.value = null
+    canEndTracking.value = false
+    recoveryMessage.value = ''
+    appendLog(tr(`[JOB] 已人工核查并结束跟踪 ${requestId}`, `[JOB] Inspection acknowledged; tracking ended for ${requestId}`))
+    loadPending()
+  } catch (error) { if (current()) recoveryMessage.value = message(error) }
+  finally { if (generation === recoveryGeneration) recoveryBusy.value = false }
+}
+function receiptChanged(event: StorageEvent): void {
+  if (event.key !== null && !event.key.startsWith(pendingPrefix())) return
+  // A removed receipt does not itself prove a running operation has finished.
+  if (!pendingRequest.value) loadPending()
+  void recoverJob()
+}
+watch(probeId, () => {
+  recoveryGeneration += 1
+  recoveryBusy.value = false
+  canEndTracking.value = false
+  subscription?.close(); subscription = null
+  jobId.value = ''; jobState.value = null; lastSequence.value = 0
+  recoveryMessage.value = ''
+  loadPending()
+  void recoverJob()
+})
 let subscription: JobSubscription | null = null
 let inspectionController: AbortController | null = null
 let inspectionGeneration = 0
@@ -149,6 +274,23 @@ const geometryReliable = computed(() => (
   inspection.value?.sector_operations_available === true
   && inspection.value.sectors.length > 0
 ))
+const algorithmChoices = computed(() => {
+  const algorithms = flashAlgorithms.value.filter(item => item.source_kind === 'daplink-builtin')
+  const conflicting = new Set<string>()
+  for (let left = 0; left < algorithms.length; left += 1) {
+    for (let right = left + 1; right < algorithms.length; right += 1) {
+      const first = algorithms[left]
+      const second = algorithms[right]
+      if (first.flash_start < second.flash_start + second.flash_size
+        && second.flash_start < first.flash_start + first.flash_size
+        && JSON.stringify(first.sector_sizes) !== JSON.stringify(second.sector_sizes)) {
+        conflicting.add(first.algorithm_id)
+        conflicting.add(second.algorithm_id)
+      }
+    }
+  }
+  return algorithms.filter(item => conflicting.has(item.algorithm_id))
+})
 const requiresSectorGeometry = computed(() => (
   actions.value.includes('erase') || actions.value.includes('program')
 ))
@@ -171,6 +313,11 @@ function actionsAreValid(values: readonly JobAction[]): boolean {
 }
 function setActions(values: JobAction[]): void {
   const next = canonicalActions(values)
+  if (security.value.family === 'nrf54l15-ctrl-ap' && (next.includes('unlock') || next.includes('lock'))) {
+    connectMode.value = next.includes('unlock') ? 'attach' : 'halt'
+    resetMode.value = 'default'
+    persist()
+  }
   if (
     ['gd32f303xe-spc', 'py32f030x8-rdp1', 'stm32g474-rdp1', 'stm32h743-rdp1', 'stm32l010x4-rdp1'].includes(security.value.family)
     && (next.includes('unlock') || next.includes('lock'))
@@ -183,8 +330,8 @@ function setActions(values: JobAction[]): void {
   }
   actions.value = next
 }
-const canStart = computed(() => !!probeId.value && !!selectedTarget.value?.installed && !!inspection.value && !inspection.value.preview_only && !!firmwareName.value && !baseError.value && !active.value && !creatingJob.value && !packBusy.value && !inspectBusy.value && actionsAreValid(actions.value) && (!hpmMode.value || (!!hpmBoard.value && isBin.value)) && (!requiresSectorGeometry.value || geometryReliable.value || hpmMode.value))
-const canErase = computed(() => !!probeId.value && !!selectedTarget.value?.installed && !hpmMode.value && !active.value && !creatingJob.value)
+const canStart = computed(() => !!probeId.value && !!selectedTarget.value?.installed && !!inspection.value && !inspection.value.preview_only && !!firmwareName.value && !baseError.value && !active.value && !creatingJob.value && !recoveryBlocked.value && !packBusy.value && !inspectBusy.value && actionsAreValid(actions.value) && (!hpmMode.value || !!hpmBoard.value) && (!requiresSectorGeometry.value || geometryReliable.value || hpmMode.value) && (!actions.value.includes('erase') || !algorithmChoices.value.length || !!selectedAlgorithmId.value))
+const canErase = computed(() => !!probeId.value && !!selectedTarget.value?.installed && !hpmMode.value && !active.value && !creatingJob.value && !recoveryBlocked.value && (!algorithmChoices.value.length || !!selectedAlgorithmId.value))
 const hpmAlgorithmNotRequired = computed(() => (
   selectedTarget.value?.part_number.toLowerCase().startsWith('hpm') ?? false
 ))
@@ -330,11 +477,20 @@ function applyPackEvent(event: Awaited<ReturnType<typeof api.installPack>>['even
   }
 }
 
+function updateTargetQuery(value: string): void {
+  if (active.value) return
+  targetQuery.value = value
+  if (!value.trim()) clearTarget()
+}
+
 function clearTarget(): void {
   if (active.value || packBusy.value) return
+  ++targetSearchGeneration
+  targetSearchController?.abort()
   selectedTarget.value = null
   desiredPart.value = ''
   targetQuery.value = ''
+  baseAddress.value = ''
   hpmBoard.value = ''
   resetInspection()
   clearMemoryWindow()
@@ -414,7 +570,10 @@ async function loadFlashAlgorithms(partNumber = selectedTarget.value?.part_numbe
   }
   try {
     const records = await api.listTargetAlgorithms(partNumber)
-    if (token === flashAlgorithmToken && !disposed) flashAlgorithms.value = records
+    if (token === flashAlgorithmToken && !disposed) {
+      flashAlgorithms.value = records
+      if (selectedAlgorithmId.value && !records.some(item => item.algorithm_id === selectedAlgorithmId.value)) selectedAlgorithmId.value = ''
+    }
   } catch (error) {
     if (token === flashAlgorithmToken) {
       flashAlgorithms.value = []
@@ -432,7 +591,7 @@ async function loadTargetMemoryMap(partNumber = selectedTarget.value?.part_numbe
   }
   targetMemoryMapBusy.value = true
   try {
-    const regions = await api.getTargetMemoryMap(partNumber)
+    const regions = await api.getTargetMemoryMap(partNumber, selectedAlgorithmId.value)
     if (token === targetMemoryMapToken && !disposed) targetMemoryRegions.value = regions
   } catch {
     if (token === targetMemoryMapToken) targetMemoryRegions.value = []
@@ -454,12 +613,21 @@ async function loadSecurityCapability(partNumber = selectedTarget.value?.part_nu
 }
 
 watch(() => selectedTarget.value?.part_number || '', partNumber => {
+  selectedAlgorithmId.value = ''
   actions.value = canonicalActions(actions.value.filter(action => action !== 'unlock' && action !== 'lock'))
   void loadCustomFlms(partNumber)
   void loadFlashAlgorithms(partNumber)
   void loadTargetMemoryMap(partNumber)
   void loadSecurityCapability(partNumber)
 })
+
+function selectAlgorithm(algorithmId: string): void {
+  if (active.value || (algorithmId && !algorithmChoices.value.some(item => item.algorithm_id === algorithmId))) return
+  selectedAlgorithmId.value = algorithmId
+  resetInspection()
+  void loadTargetMemoryMap()
+  scheduleAutoInspection()
+}
 
 async function addCustomFlm(file: File): Promise<void> {
   const partNumber = selectedTarget.value?.installed ? selectedTarget.value.part_number : ''
@@ -703,13 +871,14 @@ async function inspectImage(): Promise<void> {
   inspectionController = controller
   try {
     const result = firmwarePath.value
-      ? await api.inspectImagePath(firmwarePath.value, selectedTarget.value?.part_number || '', isBin.value ? parsedBase.value : null, controller.signal)
+      ? await api.inspectImagePath(firmwarePath.value, selectedTarget.value?.part_number || '', isBin.value ? parsedBase.value : null, controller.signal, selectedAlgorithmId.value)
       : await api.inspectImage(
           firmware.value!,
           selectedTarget.value?.part_number || '',
           isBin.value ? parsedBase.value : null,
           controller.signal,
           capturedReadSource,
+          selectedAlgorithmId.value,
         )
     if (disposed || generation !== inspectionGeneration || controller.signal.aborted || inspectionController !== controller) throw new DOMException('Aborted', 'AbortError')
     if (result.end < result.start || (isBin.value && result.base_address !== parsedBase.value)) throw new Error(tr('服务端返回的镜像地址范围无效', 'The server returned an invalid image address range'))
@@ -721,7 +890,10 @@ async function inspectImage(): Promise<void> {
     preview.setSource({ imageId: result.image_id, start: result.start, size: result.end - result.start })
     await loadVisible(0, 360)
   } catch (error) {
-    if (!(error instanceof DOMException && error.name === 'AbortError')) inspectError.value = tr(`固件检查失败：${message(error)}`, `Firmware inspection failed: ${message(error)}`)
+    if (!disposed && generation === inspectionGeneration && !controller.signal.aborted && inspectionController === controller
+      && !(error instanceof DOMException && error.name === 'AbortError')) {
+      inspectError.value = tr(`固件检查失败：${message(error)}`, `Firmware inspection failed: ${message(error)}`)
+    }
   } finally {
     if (inspectionController === controller) { inspectionController = null; inspectBusy.value = false }
   }
@@ -812,7 +984,7 @@ function receiveEvent(event: JobStreamEvent): void {
     totalProgress.value = Math.max(totalProgress.value, jobEvent.progress)
   }
   if (jobEvent.message) appendLog(`[${jobEvent.sequence}] ${jobEvent.message}`)
-  if (jobEvent.state && TERMINAL.has(jobEvent.state)) { totalProgress.value = jobEvent.state === 'succeeded' ? 1 : totalProgress.value; subscription = null }
+  if (jobEvent.state && TERMINAL.has(jobEvent.state)) { totalProgress.value = jobEvent.state === 'succeeded' ? 1 : totalProgress.value; subscription = null; void recoverJob() }
 }
 
 watch([probeId, () => selectedTarget.value?.part_number, () => inspection.value?.image_id, resetMode, resetVoltageMv, active], () => answerConfirmation(false))
@@ -820,43 +992,69 @@ watch([probeId, () => selectedTarget.value?.part_number, () => inspection.value?
 async function startJob(customActions = actions.value, sectorAddresses?: number[]): Promise<void> {
   if (confirmationMessage.value !== null) return
   const orderedActions = canonicalActions(customActions)
-  if (creatingJob.value || active.value || !probeId.value || !selectedTarget.value?.installed || !actionsAreValid(orderedActions) || (orderedActions.some(action => action === 'program' || action === 'verify') && !inspection.value)) return
+  if (creatingJob.value || recoveryBlocked.value || active.value || !probeId.value || !selectedTarget.value?.installed || !actionsAreValid(orderedActions) || (orderedActions.some(action => action === 'program' || action === 'verify') && !inspection.value)) return
   const resolvedSectors = sectorAddresses ?? (
     orderedActions.includes('erase') && inspection.value?.sector_operations_available
       ? inspection.value.sectors.map(sector => sector.address)
       : []
   )
   if (sectorAddresses === undefined && orderedActions.includes('erase') && !geometryReliable.value && !hpmMode.value) return
+  if (orderedActions.includes('erase') && algorithmChoices.value.length && !selectedAlgorithmId.value) return
   const usesReset = orderedActions.includes('reset')
   const selectedResetMode = usesReset ? resetMode.value : 'default'
   const selectedResetVoltage = selectedResetMode === 'power-cycle' ? resetVoltageMv.value : null
+  const generation = recoveryGeneration
+  const selectedProbe = probeId.value
+  const current = () => !disposed && generation === recoveryGeneration && selectedProbe === probeId.value
   creatingJob.value = true
+  let receiptKey = ''
   try {
     if (selectedResetVoltage !== null && !await confirmRisk(tr(
       `即将关闭下载器 VCC 输出，等待 3 秒后以 ${(selectedResetVoltage / 1000).toFixed(selectedResetVoltage === 5000 ? 0 : 1)}V 恢复输出。请确认目标板支持该电压并且由下载器 VCC 供电。确定继续？`,
       `The probe will disable VCC, wait 3 seconds, then restore ${(selectedResetVoltage / 1000).toFixed(selectedResetVoltage === 5000 ? 0 : 1)} V. Confirm that the target supports this voltage and is powered by probe VCC. Continue?`,
     ))) return
-    if (disposed) return
+    if (!current()) return
+    loadPending()
+    if (recoveryBlocked.value) return
+    const requestId = crypto.randomUUID()
+    // Each request owns a separate receipt; concurrent windows cannot overwrite it.
+    receiptKey = pendingPrefix() + requestId
+    localStorage.setItem(receiptKey, requestId)
+    pendingRequest.value = requestId
     progressOwner.value = 'flash'
     logs.value = []; lastSequence.value = 0; totalProgress.value = 0
-    const result = await api.createJob({ actions: orderedActions, image_id: inspection.value?.image_id, probe_id: probeId.value, target_part: selectedTarget.value.part_number, frequency: frequency.value, connect_mode: connectMode.value, reset_mode: selectedResetMode, reset_voltage_mv: selectedResetVoltage, base_address: isBin.value ? parsedBase.value : null, sector_addresses: hpmMode.value ? [] : resolvedSectors, board: hpmMode.value ? hpmBoard.value : null })
-    if (disposed) return
+    const result = await api.createJob({ actions: orderedActions, image_id: inspection.value?.image_id, algorithm_id: selectedAlgorithmId.value || null, probe_id: probeId.value, target_part: selectedTarget.value.part_number, frequency: frequency.value, connect_mode: connectMode.value, reset_mode: selectedResetMode, reset_voltage_mv: selectedResetVoltage, base_address: isBin.value ? parsedBase.value : null, sector_addresses: hpmMode.value ? [] : resolvedSectors, board: hpmMode.value ? hpmBoard.value : null }, requestId)
+    if (!current() || pendingRequest.value !== requestId) return
     jobId.value = result.job_id; jobState.value = result.job.state
     appendLog(tr(`[JOB] 已创建 ${result.job_id}`, `[JOB] Created ${result.job_id}`)); subscribe(0)
-  } catch (error) { appendLog(`[ERROR] ${message(error)}`) }
+  } catch (error) {
+    if (error instanceof OnlineFlashApiError && error.notStarted && receiptKey) {
+      localStorage.removeItem(receiptKey)
+      if (current()) { recoveryMessage.value = ''; loadPending() }
+    }
+    if (current()) {
+      appendLog(`[ERROR] ${message(error)}`)
+      if (error instanceof OnlineFlashApiError && !error.notStarted) void recoverJob()
+    }
+  }
   finally { creatingJob.value = false }
 }
 async function stopJob(): Promise<void> {
   if (!jobId.value || stopping.value) return
   const previousState = jobState.value
+  const stoppedJob = jobId.value
+  const generation = recoveryGeneration
+  const current = () => !disposed && generation === recoveryGeneration && stoppedJob === jobId.value
   jobState.value = 'stopping'; appendLog(tr('[JOB] STOPPING：等待探针安全停止', '[JOB] STOPPING: waiting for the probe to stop safely'))
   try {
-    const snapshot = await api.stopJob(jobId.value)
+    const snapshot = await api.stopJob(stoppedJob)
+    if (!current()) return
     if ((!jobState.value || !TERMINAL.has(jobState.value)) && TERMINAL.has(snapshot.state)) {
       jobState.value = snapshot.state
     }
   }
   catch (error) {
+    if (!current()) return
     if (jobState.value === 'stopping') jobState.value = previousState
     appendLog(tr(`[ERROR] 停止请求失败：${message(error)}`, `[ERROR] Stop request failed: ${message(error)}`))
   }
@@ -871,6 +1069,7 @@ function toggleSector(address: number): void {
 }
 
 onMounted(() => {
+  window.addEventListener('storage', receiptChanged)
   startSourcePolling()
   void Promise.all([refreshProbes(true), refreshPackStatus(), searchTargets(targetQuery.value), refreshDesiredTarget(), loadCustomFlms()])
     .catch(error => { if (!disposed) packError.value = message(error) })
@@ -885,7 +1084,10 @@ onDeactivated(() => {
   stopNativeDrops()
 })
 onBeforeUnmount(() => {
+  clearTimeout(recoveryTimer)
   disposed = true
+  recoveryGeneration += 1
+  window.removeEventListener('storage', receiptChanged)
   stopSourcePolling()
   stopNativeDrops()
   if (autoInspectTimer !== null) clearTimeout(autoInspectTimer)
@@ -902,16 +1104,23 @@ onBeforeUnmount(() => {
 <template>
   <div class="online-flash-grid" :inert="confirmationMessage !== null">
     <aside class="workspace-zone settings-zone" data-zone="settings">
-      <ProbeSettingsPanel :probes="probes" :selected-id="probeId" :frequency="frequency" :connect-mode="connectMode" :reset-mode="resetMode" :reset-voltage-mv="resetVoltageMv" :busy="probeBusy || active" :error="probeError" @refresh="refreshProbes" @update:selected-id="probeId = $event" @update:frequency="frequency = $event" @update:connect-mode="connectMode = $event" @update:reset-mode="resetMode = $event" @update:reset-voltage-mv="resetVoltageMv = $event" />
-      <TargetPackPanel :targets="targets" :query="targetQuery" :selected-part="selectedTarget?.part_number || ''" :selected-installed="!!selectedTarget?.installed" :status="packStatus" :busy="packBusy" :cancel-pending="packCancelPending" :progress="packProgress" :phase="packPhase" :error="packError" :algorithms="customFlms" :flash-algorithms="flashAlgorithms" :algorithm-busy="customFlmBusy" :algorithm-error="customFlmError" :can-manage-algorithms="!active && !hpmAlgorithmNotRequired" :algorithm-not-required="hpmAlgorithmNotRequired" @search="searchTargets" @update:query="targetQuery = $event" @select="selectTarget" @clear-target="clearTarget" @update-index="updatePackIndex" @import-pack="importPack" @cancel="cancelPack" @add-algorithm="addCustomFlm" @remove-algorithm="removeCustomFlm" />
+      <ProbeSettingsPanel :probes="probes" :selected-id="probeId" :frequency="frequency" :connect-mode="connectMode" :reset-mode="resetMode" :reset-voltage-mv="resetVoltageMv" :busy="probeBusy || active || creatingJob || recoveryBusy" :error="probeError" @refresh="refreshProbes" @update:selected-id="probeId = $event" @update:frequency="frequency = $event" @update:connect-mode="connectMode = $event" @update:reset-mode="resetMode = $event" @update:reset-voltage-mv="resetVoltageMv = $event" />
+      <TargetPackPanel :targets="targets" :query="targetQuery" :selected-part="selectedTarget?.part_number || ''" :selected-installed="!!selectedTarget?.installed" :selected-algorithm-id="selectedAlgorithmId" :algorithm-choices="algorithmChoices" :selection-locked="active" :status="packStatus" :busy="packBusy" :cancel-pending="packCancelPending" :progress="packProgress" :phase="packPhase" :error="packError" :algorithms="customFlms" :flash-algorithms="flashAlgorithms" :algorithm-busy="customFlmBusy" :algorithm-error="customFlmError" :can-manage-algorithms="!active && !hpmAlgorithmNotRequired" :algorithm-not-required="hpmAlgorithmNotRequired" @search="searchTargets" @update:query="updateTargetQuery" @select="selectTarget" @select-algorithm="selectAlgorithm" @update-index="updatePackIndex" @import-pack="importPack" @cancel="cancelPack" @add-algorithm="addCustomFlm" @remove-algorithm="removeCustomFlm" />
       <label v-if="hpmMode" class="hpm-setting"><span>{{ tr('HPM 板卡', 'HPM Board') }}</span><select v-model="hpmBoard" data-testid="hpm-board"><option v-for="item in hpmBoards" :key="item" :value="item">{{ item }}</option></select></label>
     </aside>
     <main class="workspace-zone firmware-zone" data-zone="firmware">
       <MemoryReadPanel ref="memoryReadRef" embedded :probe-id="probeId" :target-part="selectedTarget?.part_number || ''" :hpm="hpmMode" :board="hpmBoard || undefined" :frequency="frequency" :connect-mode="connectMode" :reset-mode="resetMode" :memory-regions="targetMemoryRegions" :memory-map-busy="targetMemoryMapBusy" :disabled="memoryReadDisabled" @progress="onMemoryReadProgress" @log="onMemoryReadLog" @data="onMemoryReadData" />
       <FirmwareWorkspace :file="firmware" :source-path="firmwarePath" :native-drop-active="nativeDropActive" :base-address="baseAddress" :base-error="baseError" :inspection="inspection" :rows="rows" :padding-top="paddingTop" :padding-bottom="paddingBottom" :loading="inspectBusy" :error="inspectError" :memory-data="memoryReadData" :memory-address="memoryReadAddress" :read-disabled="memoryReadDisabled" :read-busy="memoryReadBusy" @file="setFirmware" @browse="browseFirmware" @drop-files="acceptFirmwareSources" @base="setBase" @scroll="loadVisible" @read="openMemoryReadDialog" @save="saveMemoryFile" @clear-data="clearDataWindow" />
-      <FlashActionBar :actions="actions" :can-start="canStart" :active="active" :stopping="stopping" :state="jobState" :total-progress="progressValue" :progress-label="progressLabel" :progress-state="progressState" :unlock-enabled="security.unlock_supported" :lock-enabled="security.lock_supported" :security-reason="security.reason" :unlock-erases-eeprom="security.unlock_erases_eeprom" :unlock-erases-backup-registers="security.unlock_erases_backup_registers" @actions="setActions" @start="startJob()" @stop="stopJob" />
+      <section v-if="recoveryBlocked && !active && !creatingJob" role="status" data-testid="online-recovery">
+        <p>{{ tr('已有待确认的在线请求，暂不允许新任务。', 'An online request awaits confirmation; new jobs are disabled.') }}</p>
+        <code>{{ pendingRequest }}</code>
+        <p>{{ recoveryMessage }}</p>
+        <button data-testid="query-online-request" :disabled="recoveryBusy || creatingJob || !pendingRequest" @click="recoverJob">{{ tr('查询原任务', 'Query original job') }}</button>
+        <button v-if="canEndTracking" data-testid="end-online-tracking" :disabled="recoveryBusy || creatingJob" @click="endTracking">{{ tr('人工核查后结束跟踪', 'End tracking after inspection') }}</button>
+      </section>
+      <FlashActionBar :actions="actions" :can-start="canStart" :active="active" :stopping="stopping" :state="jobState" :total-progress="progressValue" :progress-label="progressLabel" :progress-state="progressState" :unlock-enabled="security.unlock_supported" :lock-enabled="security.lock_supported" :security-reason="security.reason" :security-family="security.family" :unlock-erases-eeprom="security.unlock_erases_eeprom" :unlock-erases-backup-registers="security.unlock_erases_backup_registers" @actions="setActions" @start="startJob()" @stop="stopJob" />
     </main>
-    <aside class="workspace-zone flash-map-zone" data-zone="flash-map"><FlashMapPanel :segments="inspection?.segments || []" :sectors="inspection?.sectors || []" :selected-addresses="selectedSectorAddresses" :inspection-ready="!!inspection" :geometry-reliable="geometryReliable" :can-erase="canErase" @chip-erase="chipErase" @selected-erase="selectedErase" @range-erase="rangeErase" @select-all="selectedSectorAddresses = inspection?.sectors.map(sector => sector.address) || []" @clear-selection="selectedSectorAddresses = []" @toggle-sector="toggleSector" /></aside>
+    <aside class="workspace-zone flash-map-zone" data-zone="flash-map"><FlashMapPanel :segments="inspection?.segments || []" :sectors="inspection?.sectors || []" :selected-addresses="selectedSectorAddresses" :inspection-ready="!!inspection" :geometry-reliable="geometryReliable" :geometry-message="hpmMode ? tr('HPM 由设备端 ROM 查询容量并擦写，支持 BIN / HEX；此处不提供独立扇区擦除。', 'HPM ROM queries capacity and programs BIN / HEX. Separate sector erase is unavailable.') : algorithmChoices.length && !selectedAlgorithmId ? tr('该器件有多套扇区布局，请先在左侧选择与目标 Bank 模式一致的 FLM。', 'This target has multiple sector layouts. Select the FLM matching its bank mode on the left.') : inspection?.validation_message" :can-erase="canErase" @chip-erase="chipErase" @selected-erase="selectedErase" @range-erase="rangeErase" @select-all="selectedSectorAddresses = inspection?.sectors.map(sector => sector.address) || []" @clear-selection="selectedSectorAddresses = []" @toggle-sector="toggleSector" /></aside>
     <section class="workspace-zone logs-zone" data-zone="logs"><FlashLogPanel :lines="logs" :stream-disconnected="streamDisconnected" @clear="logs = []" @reconnect="subscribe(lastSequence)" /></section>
     <div v-if="binAddressOpen" class="bin-address-backdrop" data-testid="bin-address-dialog" @click.self="cancelBinAddress">
       <section class="bin-address-dialog" role="dialog" aria-modal="true" aria-labelledby="bin-address-title">
@@ -933,7 +1142,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.online-flash-grid{--of-bg:#11151a;--of-surface:#1d2229;--of-input:#252b33;--of-border:#343c46;--of-text:#e6e9ed;--of-muted:#929ba7;--of-accent:#58a6d6;--of-danger:#f07178;--of-danger-bg:#3b2428;--of-ok:#65c18c;--of-ok-bg:#20372d;--of-warn:#d8ad62;--of-mono:var(--mono,ui-monospace,Consolas,monospace);box-sizing:border-box;height:calc(100dvh - 92px);min-height:0;display:grid;grid-template-columns:minmax(230px,.85fr) minmax(0,1.9fr) minmax(240px,.9fr);grid-template-rows:minmax(0,1fr) minmax(130px,185px);gap:10px;padding:10px;border-radius:var(--radius,7px);background:var(--of-bg);color:var(--of-text);text-align:left;font-size:12px}.workspace-zone{min-width:0;min-height:0;overflow:hidden;border:1px solid var(--of-border);border-radius:7px;background:var(--of-surface)}.settings-zone,.flash-map-zone{overflow:auto}.firmware-zone{min-height:0;display:flex;flex-direction:column}.firmware-zone :deep(.hex-scroll){min-height:0;flex:1}.logs-zone{grid-column:1/-1;font-family:var(--of-mono)}@media(max-width:1050px){.online-flash-grid{height:auto;min-height:660px;grid-template-columns:minmax(220px,.8fr) minmax(0,1.6fr);grid-template-rows:auto}.flash-map-zone{grid-column:1/-1}.logs-zone{grid-column:1/-1}}@media(max-width:760px){.online-flash-grid{grid-template-columns:1fr;grid-template-rows:none}.flash-map-zone,.logs-zone{grid-column:auto}.firmware-zone{min-height:560px}}
+.online-flash-grid{box-sizing:border-box;height:calc(100dvh - 92px);min-height:0;display:grid;grid-template-columns:minmax(230px,.85fr) minmax(0,1.9fr) minmax(240px,.9fr);grid-template-rows:minmax(0,1fr) minmax(130px,185px);gap:10px;padding:10px;border-radius:var(--radius,7px);background:var(--of-bg);color:var(--of-text);text-align:left;font-size:12px}.workspace-zone{min-width:0;min-height:0;overflow:hidden;border:1px solid var(--of-border);border-radius:7px;background:var(--of-surface)}.settings-zone,.flash-map-zone{overflow:auto}.firmware-zone{min-height:0;display:flex;flex-direction:column}.firmware-zone :deep(.hex-scroll){min-height:0;flex:1}.logs-zone{grid-column:1/-1;font-family:var(--of-mono)}@media(max-width:1050px){.online-flash-grid{height:auto;min-height:660px;grid-template-columns:minmax(220px,.8fr) minmax(0,1.6fr);grid-template-rows:auto}.flash-map-zone{grid-column:1/-1}.logs-zone{grid-column:1/-1}}@media(max-width:760px){.online-flash-grid{grid-template-columns:1fr;grid-template-rows:none}.flash-map-zone,.logs-zone{grid-column:auto}.firmware-zone{min-height:560px}}
 .hpm-setting{display:grid;gap:5px;padding:10px;border-top:1px solid var(--of-border);color:var(--of-muted)}.hpm-setting select{min-width:0;width:100%;height:30px;border:1px solid var(--of-border);border-radius:5px;background:var(--of-input);color:var(--of-text);padding:0 8px}
 .bin-address-backdrop{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.58)}.bin-address-dialog{width:min(420px,100%);padding:20px;border:1px solid var(--of-border);border-radius:7px;background:var(--of-surface);box-shadow:0 18px 50px rgba(0,0,0,.35)}.bin-address-dialog h2{margin:0 0 8px;font-size:17px;letter-spacing:0}.bin-address-dialog>p{margin:0 0 16px;color:var(--of-muted);line-height:1.5}.bin-address-dialog label{display:grid;gap:6px;color:var(--of-muted)}.bin-address-dialog input{height:36px;padding:0 10px;border:1px solid var(--of-border);border-radius:5px;background:var(--of-input);color:var(--of-text);font-family:var(--of-mono);font-size:14px}.bin-address-dialog input:focus{outline:2px solid var(--of-accent);outline-offset:1px}.bin-address-dialog .bin-address-error{margin:8px 0 0;color:var(--of-danger);font-size:11px}.bin-address-dialog footer{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.bin-address-dialog button{min-width:72px;height:32px;border:1px solid var(--of-border);border-radius:5px;cursor:pointer}.bin-address-cancel{background:var(--of-input);color:var(--of-text)}.bin-address-confirm{border-color:var(--of-accent)!important;background:var(--of-accent);color:#0d1720}.bin-address-confirm:disabled{cursor:not-allowed;opacity:.45}
 </style>

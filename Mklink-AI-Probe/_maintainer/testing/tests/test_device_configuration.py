@@ -1,5 +1,4 @@
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -8,8 +7,8 @@ from fastapi.testclient import TestClient
 from mklink.device_configuration import (
     describe_configuration,
     read_configuration,
-    run_cli,
 )
+from test_runtime_probe import probe
 
 
 class HpmDevice:
@@ -24,7 +23,7 @@ class HpmDevice:
         self.reads.append((address, size))
         assert size == 4
         # Public USB configuration: different fuse and shadow values.
-        return {0xF3050510: 0x12345678, 0xF3050110: 0xABCD9876}.get(
+        return {0xF3050500: 0x11705142, 0xF3050510: 0x12345678, 0xF3050110: 0xABCD9876}.get(
             address, 0
         ).to_bytes(4, "little")
 
@@ -32,7 +31,7 @@ class HpmDevice:
 def test_hpm_reads_only_public_words_and_keeps_shadow_distinct():
     dev = HpmDevice()
     result = read_configuration(dev, "HPM5301xEGx")
-    assert dev.reads == [
+    assert dev.reads == [(0xF3050500, 4)] + [
         (base + index * 4, 4)
         for index in (0, 1, 3, 68)
         for base in (0xF3050400, 0xF3050000)
@@ -58,6 +57,18 @@ def test_hpm_identity_checked_before_any_memory_access(name, code):
     with pytest.raises(ValueError, match="does not match"):
         read_configuration(dev, "HPM5301")
     assert not dev.reads
+
+
+@pytest.mark.parametrize("blocked_value", [0, 0x20150407, 0xFFFFFFFF])
+def test_hpm_cached_name_does_not_bypass_live_chip_identity(blocked_value):
+    dev = HpmDevice()
+    def protected_read(address, size):
+        dev.reads.append((address, size))
+        return blocked_value.to_bytes(4, "little")
+    dev.read_memory = protected_read
+    with pytest.raises(ValueError, match="debug access may be protected"):
+        read_configuration(dev, "HPM5301")
+    assert dev.reads == [(0xF3050500, 4)]
 
 
 def test_short_read_and_unknown_chip_are_not_zero_snapshots():
@@ -128,26 +139,24 @@ def test_description_preserves_probe_model_restrictions():
         assert not result["security"]["lock_supported"]
 
 
-def test_cli_and_mcp_share_the_same_snapshot(monkeypatch, capsys):
+@pytest.mark.parametrize("model", ["V2", "V3"])
+@pytest.mark.parametrize("part", ["HPM5301", "HPM5301XEGX"])
+def test_hpm_configuration_rejects_unsupported_probe_before_io(model, part):
+    description = describe_configuration(part, model)
+    assert not description["supported"] and not description["read_supported"]
+    device = HpmDevice()
+    with pytest.raises(ValueError, match="HPM targets require V4"):
+        read_configuration(device, part, model)
+    assert device.reads == []
+
+
+def test_legacy_mcp_uses_the_same_snapshot(monkeypatch):
     import fastmcp
     from mklink import mcp_server
 
     dev = HpmDevice()
 
-    class Connection:
-        def __enter__(self):
-            return dev
-
-        def __exit__(self, *_):
-            pass
-
-    monkeypatch.setattr("mklink.device.connect", lambda **_: Connection())
-    run_cli(
-        SimpleNamespace(
-            action="read", chip="HPM5301", model="V4", port=None, project_root="."
-        )
-    )
-    cli = json.loads(capsys.readouterr().out)
+    expected = read_configuration(dev, 'HPM5301')
     monkeypatch.setattr(mcp_server, "_connected_device", lambda: dev)
     server = fastmcp.FastMCP("configuration-contract")
     mcp_server._register_variable_tools(server)
@@ -161,9 +170,43 @@ def test_cli_and_mcp_share_the_same_snapshot(monkeypatch, capsys):
                 "read_configuration", {"part_number": "HPM5301"}
             )
             assert description.data["read_supported"]
-            assert result.data["fields"] == cli["fields"]
+            assert result.data["fields"] == expected["fields"]
 
     asyncio.run(exchange())
+
+
+def test_shared_configuration_reuses_route_identity_and_resource_admission(probe):
+    from mklink._types import DeviceState
+    client, control, state, _, _, managers, _ = probe
+    device = HpmDevice()
+    device.port = 'COM9'
+    device.state = DeviceState.READY
+    device.axf_status = {'loaded': False}
+    state['device'] = device
+    session = client.post('/_runtime/attach', json={}).json()['session_id']
+    def read(part='HPM5301', model='V4'):
+        return client.post('/_runtime/call', json={'session_id': session, 'capability': 'read_configuration',
+                           'arguments': {'part_number': part, 'model': model}})
+    managers['rtt'].running = True
+    assert read().status_code == 409
+    assert device.reads == [] and managers['rtt'].running
+    managers['rtt'].running = False
+    assert read(model='V1').status_code == 422 and device.reads == []
+    device.idcode = 0
+    assert read().status_code == 422 and device.reads == []
+    device.idcode = 0x1000563D
+    response = read()
+    assert response.status_code == 200, response.text
+    assert response.json()['fields'] == read_configuration(HpmDevice(), 'HPM5301')['fields']
+    assert len(device.reads) == 9 and not state['resource_manager'].get_status()
+    device.reads.clear()
+    def failed_read(address, size):
+        device.reads.append((address, size))
+        raise TimeoutError('unknown read result')
+    device.read_memory = failed_read
+    response = read()
+    assert response.status_code == 422 and len(device.reads) == 1
+    assert not control.operation_lock.locked() and not state['resource_manager'].get_status()
 
 
 def test_web_description_offline_and_read_requires_connection(tmp_path):

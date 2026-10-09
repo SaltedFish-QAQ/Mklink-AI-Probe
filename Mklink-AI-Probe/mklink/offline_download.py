@@ -4,13 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
+import os
 from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Mapping, Optional, Sequence, Union
+from typing import Callable, Mapping, Optional, Sequence, Union
 
+from mklink.file_content import copy_verified
 from mklink.offline_security import OfflineSecurityPlan, resolve_offline_security
+from mklink.hpm_offline_otp import OfflineOtp, resolve as resolve_hpm_otp, script_lines as otp_script_lines
 from mklink.stm32f1_options import (
     OptionPlan,
     resolve_plan as resolve_option_plan,
@@ -25,6 +29,15 @@ _SOURCE_KINDS = frozenset(("upload", "pack", "profile", "existing"))
 
 class OfflineDownloadError(ValueError):
     """Invalid offline configuration or deployment state."""
+
+
+class OfflineRecoveryError(OfflineDownloadError):
+    """Deployment rollback was incomplete; backups must remain available."""
+
+    def __init__(self, directory):
+        self.recovery_directory = str(directory)
+        super().__init__('Offline rollback incomplete; inspect the bound disk before retrying. '
+                         'Recovery files retained at: ' + self.recovery_directory)
 
 
 @dataclass(frozen=True)
@@ -65,6 +78,7 @@ class OfflineDownloadConfig:
     firmwares: tuple[OfflineFirmware, ...]
     security: Optional[OfflineSecurityPlan]
     option_bytes: Optional[OptionPlan] = None
+    hpm_user_otp: Optional[OfflineOtp] = None
 
     @property
     def script_name(self) -> str:
@@ -166,7 +180,7 @@ def parse_offline_config(
         payload.get("swd_clock_hz", 10000000),
         "SWD clock",
         100000,
-        30000000 if model == "V4" else 10000000,
+        30000000,
     )
     from mklink.debug_speed import validate_clock_hz
     try:
@@ -175,6 +189,7 @@ def parse_offline_config(
         raise OfflineDownloadError("SWD " + str(error)) from error
     target_part = str(payload.get("target_part") or "").strip() or None
     try:
+        hpm_user_otp = resolve_hpm_otp(payload.get("hpm_user_otp"), target_part or '', model)
         option_bytes = resolve_option_plan(
             target_part or "", model, payload.get("option_bytes", {})
         )
@@ -183,6 +198,8 @@ def parse_offline_config(
     from mklink.hpm_config import is_hpm_target, normalize_hpm_configuration
 
     hpm_target = is_hpm_target(target_part)
+    if hpm_target and model != "V4":
+        raise OfflineDownloadError("HPM targets require V4 downloader firmware")
     erase_all_before_download = _strict_bool(
         payload.get("erase_all_before_download", False),
         "erase-all-before-download",
@@ -292,8 +309,6 @@ def parse_offline_config(
             if raw.get("base_address") in (None, ""):
                 raise OfflineDownloadError("BIN firmware requires a base address")
             base_address = _parse_int(raw.get("base_address"), "BIN base address")
-        elif hpm_target:
-            raise OfflineDownloadError("HPM ROM API only supports BIN firmware")
         raw_upload_index = raw.get("upload_index")
         source_path = str(raw.get("source_path") or "").strip() or None
         upload_index = (
@@ -344,6 +359,7 @@ def parse_offline_config(
         firmwares=tuple(firmwares),
         security=security,
         option_bytes=option_bytes,
+        hpm_user_otp=hpm_user_otp,
     )
 
 
@@ -362,7 +378,11 @@ def _program_lines(config: OfflineDownloadConfig, indent: str) -> list[str]:
             f"{indent}    break",
         ))
         for firmware in config.firmwares:
-            call = f'hpm.program("{firmware.file_name}", 0x{firmware.base_address:08X})'
+            method = "program_verified" if config.hpm_user_otp is not None else "program"
+            call = (
+                f'hpm.program_hex("{firmware.file_name}")' if firmware.format == "hex" else
+                f'hpm.{method}("{firmware.file_name}", 0x{firmware.base_address:08X})'
+            )
             lines.extend((
                 f"{indent}if {call} != 0:",
                 f'{indent}    print("HPM program failed: {firmware.file_name}")',
@@ -424,9 +444,10 @@ def _security_lines(
     action: str,
     indent: str,
 ) -> list[str]:
-    config_file = f"CFG/{security.config_dir}/{action}.cfg"
+    config_root = "Python/CFG" if security.algorithm_path is None else "CFG"
+    config_file = f"{config_root}/{security.config_dir}/{action}.cfg"
     result_name = f"security_{action}_rc"
-    return [
+    load_lines = [
         (
             f'{indent}if load.flm("FLM/{security.algorithm_file_name}", '
             f"0x{security.option_address:08X}, 0x{security.ram_base:08X}) != 0:"
@@ -434,6 +455,8 @@ def _security_lines(
         f'{indent}    print("load option flm failed: {security.algorithm_file_name}")',
         f"{indent}    abort = True",
         f"{indent}    break",
+    ] if security.algorithm_path is not None else []
+    return load_lines + [
         f'{indent}{result_name} = cmd.{action}("{config_file}")',
         f"{indent}if {result_name} != 0:",
         f'{indent}    print("security {action} failed:", {result_name})',
@@ -518,6 +541,14 @@ def generate_offline_script(config: OfflineDownloadConfig) -> str:
         "        break",
         '    print("IDCODE: 0x%08X" % idcode)',
     ]
+    if config.is_hpm and any(f.format == "hex" for f in config.firmwares):
+        insert_at = lines.index("    elapsed = 0")
+        lines[insert_at:insert_at] = [
+            '    if hpm.program_hex() != -1:',
+            '        print("Upgrade downloader firmware: HPM HEX support required")',
+            '        abort = True',
+            '        break',
+        ]
     if config.security is not None:
         # Missing-file calls stop before target access and verify that the
         # generated Pika bindings preserve the signed security return code.
@@ -525,6 +556,15 @@ def generate_offline_script(config: OfflineDownloadConfig) -> str:
         lines[insert_at:insert_at] = _security_api_preflight_lines("    ")
     if config.security is not None and config.security.unlock_before_download:
         lines.extend(_security_lines(config.security, action="unlock", indent="    "))
+    if config.hpm_user_otp is not None:
+        lines.extend([
+            '    # Capability probe: no file/target access, signed failure required.',
+            '    if hpm.program_verified() != -1:',
+            '        print("Upgrade HPMLink: verified offline programming required for OTP")',
+            '        abort = True',
+            '        break',
+        ])
+        lines.extend(otp_script_lines(config.hpm_user_otp, commit=False))
     if config.option_bytes is not None:
         lines.extend(
             script_block(
@@ -541,6 +581,8 @@ def generate_offline_script(config: OfflineDownloadConfig) -> str:
         )
     else:
         lines.extend(_program_lines(config, "    "))
+    if config.hpm_user_otp is not None:
+        lines.extend(otp_script_lines(config.hpm_user_otp, commit=True))
     if config.security is not None and config.security.lock_after_download:
         lines.extend(_security_lines(config.security, action="lock", indent="    "))
     lines.extend(
@@ -627,62 +669,95 @@ def _same_file_content(first: Path, second: Path) -> bool:
 def _transactional_copy(
     disk_root: Path,
     files: Sequence[tuple[Path, Optional[Path], Optional[bytes]]],
+    recovery_callback: Optional[Callable[[Optional[Path]], None]] = None,
+    *, hpm_hex_files: frozenset[str] = frozenset(),
 ) -> list[str]:
-    with tempfile.TemporaryDirectory(prefix="mklink-offline-staging-") as raw_stage:
-        stage = Path(raw_stage)
-        backup_root = stage / "backup"
-        staged_root = stage / "files"
-        installed = []
-        backups = []
+    stage = Path(tempfile.mkdtemp(prefix="mklink-offline-staging-"))
+    backup_root = stage / "backup"
+    staged_root = stage / "files"
+    installed = []
+    backups = []
+    preserve = False
+    try:
         try:
             for relative, source, content in files:
                 relative = _relative_destination(relative)
                 staged = staged_root / relative
                 staged.parent.mkdir(parents=True, exist_ok=True)
                 if source is not None:
-                    shutil.copy2(source, staged)
+                    if relative.as_posix().casefold() in hpm_hex_files:
+                        from mklink.hpm_image import prepare_hpm_hex
+                        prepare_hpm_hex(source, staged)
+                    else:
+                        shutil.copy2(source, staged)
                 else:
                     staged.write_bytes(content or b"")
 
+            if recovery_callback is not None:
+                recovery_callback(stage)
             for relative, _source, _content in files:
                 relative = _relative_destination(relative)
                 destination = disk_root / relative
                 staged = staged_root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if destination.exists():
-                    # A browser may still hold the selected USB file open. Reuse
-                    # identical content instead of deleting or rewriting it.
                     if _same_file_content(destination, staged):
                         continue
                     backup = backup_root / relative
                     backup.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(destination, backup)
-                    _remove_probe_file(destination)
+                    # Track the backup before any destructive operation.
                     backups.append((destination, backup))
+                    _remove_probe_file(destination)
                 installed.append(destination)
-                shutil.copy2(staged, destination)
-            return [
-                relative.as_posix() for relative, _source, _content in files
-            ]
+                copy_verified(staged, destination)
+            return [relative.as_posix() for relative, _source, _content in files]
         except BaseException as error:
+            # Keep backups if rollback itself is interrupted.
+            preserve = True
+            failures = []
             for destination in reversed(installed):
                 try:
                     if destination.exists():
-                        destination.unlink()
+                        _remove_probe_file(destination)
                 except OSError:
-                    pass
+                    failures.append('remove: ' + str(destination.relative_to(disk_root)))
             for destination, backup in reversed(backups):
                 try:
-                    if backup.exists():
-                        destination.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(backup, destination)
+                    if not backup.is_file():
+                        raise OSError('Backup unavailable')
+                    if destination.exists() and _same_file_content(destination, backup):
+                        continue
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    copy_verified(backup, destination)
                 except OSError:
-                    pass
+                    failures.append('restore: ' + str(destination.relative_to(disk_root)))
+            if failures:
+                preserve = True
+                # Diagnostic only: no automatic replay or cross-volume restoration.
+                manifest = {'disk_root': str(disk_root), 'rollback_errors': failures,
+                            'backups': [str(b.relative_to(stage)) for _, b in backups]}
+                try:
+                    (stage / 'recovery.json').write_text(json.dumps(manifest), encoding='utf-8')
+                except OSError:
+                    pass  # Backup preservation must not depend on metadata writes.
+                raise OfflineRecoveryError(stage) from error
+            preserve = False
             if isinstance(error, OSError):
                 raise OfflineDownloadError(
                     f"offline file operation failed: {relative.as_posix()}: {error}"
                 ) from error
             raise
+    finally:
+        if not preserve:
+            def remove_readonly(function, path, error):
+                if function is os.unlink and isinstance(error[1], PermissionError):
+                    _remove_probe_file(Path(path))
+                else:
+                    raise error[1]
+            shutil.rmtree(stage, onerror=remove_readonly)
+            if recovery_callback is not None:
+                recovery_callback(None)
 
 
 def deploy_offline_bundle(
@@ -691,6 +766,7 @@ def deploy_offline_bundle(
     *,
     firmware_sources: SourceCollection,
     algorithm_sources: SourceCollection,
+    recovery_callback: Optional[Callable[[Optional[Path]], None]] = None,
 ) -> dict:
     disk = Path(disk_root).resolve()
     if not disk.is_dir():
@@ -732,28 +808,29 @@ def deploy_offline_bundle(
 
     if config.security is not None:
         security = config.security
-        try:
-            digest = hashlib.sha256(security.algorithm_path.read_bytes()).hexdigest()
-        except OSError as error:
-            raise OfflineDownloadError("built-in option-byte FLM is unavailable") from error
-        if digest != security.algorithm_sha256:
-            raise OfflineDownloadError("built-in option-byte FLM integrity check failed")
-        security_files = [
-            (
-                Path("FLM") / security.algorithm_file_name,
-                security.algorithm_path,
-                None,
-            ),
-        ]
+        security_files = []
+        if security.algorithm_path is not None:
+            try:
+                digest = hashlib.sha256(security.algorithm_path.read_bytes()).hexdigest()
+            except OSError as error:
+                raise OfflineDownloadError("built-in option-byte FLM is unavailable") from error
+            if digest != security.algorithm_sha256:
+                raise OfflineDownloadError("built-in option-byte FLM integrity check failed")
+            security_files.append((Path("FLM") / security.algorithm_file_name,
+                                   security.algorithm_path, None))
         if security.unlock_before_download:
             security_files.append((
-                Path("CFG") / security.config_dir / "unlock.cfg",
+                (Path("Python") / "CFG" / security.config_dir / "unlock.cfg")
+                if security.algorithm_path is None
+                else (Path("CFG") / security.config_dir / "unlock.cfg"),
                 None,
                 security.unlock_config,
             ))
         if security.lock_after_download:
             security_files.append((
-                Path("CFG") / security.config_dir / "lock.cfg",
+                (Path("Python") / "CFG" / security.config_dir / "lock.cfg")
+                if security.algorithm_path is None
+                else (Path("CFG") / security.config_dir / "lock.cfg"),
                 None,
                 security.lock_config,
             ))
@@ -786,7 +863,11 @@ def deploy_offline_bundle(
     plan.append(
         (script_relative, None, generate_offline_script(config).encode("utf-8"))
     )
-    deployed = _transactional_copy(disk, plan)
+    if config.is_hpm and any(f.format == "hex" for f in config.firmwares):
+        deployed = _transactional_copy(disk, plan, recovery_callback,
+            hpm_hex_files=frozenset(f.file_name.casefold() for f in config.firmwares if f.format == "hex"))
+    else:
+        deployed = _transactional_copy(disk, plan, recovery_callback)
     return {
         "status": "deployed",
         "model": config.model,

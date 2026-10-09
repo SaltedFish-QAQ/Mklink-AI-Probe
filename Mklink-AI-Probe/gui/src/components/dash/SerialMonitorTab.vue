@@ -3,8 +3,8 @@
     <div class="serial-config-row">
       <label>
         <span>{{ tr('端口', 'Port') }}</span>
-        <select v-model="portName" :disabled="running || starting || stopping || ymodemActive || ymodemStarting">
-          <option v-for="port in ports" :key="port.device" :value="port.device">
+        <select v-model="portName" :disabled="starting || stopping || ymodemStarting">
+          <option v-for="port in selectablePorts" :key="port.device" :value="port.device">
             {{ port.device }}{{ port.description ? ` · ${port.description}` : '' }}
           </option>
         </select>
@@ -54,6 +54,15 @@
       <button v-else type="button" class="btn btn-danger" :disabled="stopping || ymodemActive || ymodemStarting" @click="doStop">
         {{ stopping ? tr('停止中', 'Stopping') : tr('关闭串口', 'Close Port') }}
       </button>
+      <button
+        type="button" class="serial-extensions-toggle" :class="{ active: extensionsOpen }"
+        :aria-expanded="extensionsOpen" aria-controls="serial-extensions"
+        @click="extensionsOpen = !extensionsOpen"
+      >
+        <SlidersHorizontal :size="14" />{{ tr('扩展功能', 'Extensions') }}
+        <span v-if="extensionsStatus" class="extensions-status">{{ extensionsStatus }}</span>
+        <ChevronDown :size="14" :class="{ rotated: extensionsOpen }" />
+      </button>
     </div>
     <SetupHint
       v-if="portsLoaded && !ports.length && !running"
@@ -63,6 +72,23 @@
       :busy="refreshingPorts"
       @primary="refreshPorts"
     />
+
+    <div v-show="extensionsOpen" id="serial-extensions" class="serial-extensions">
+    <SerialAutomationPanel
+      :model-value="automation" :locked="running || starting || stopping"
+      :port="portName" :frame="latestFrames[portName]" @update:model-value="editAutomation"
+    />
+
+    <SerialRecordingPanel :status="recording" :running="running && !stopping" :port="portName"
+      :busy="recordingBusy" :error="recordingError" @start="startRecording" @stop="stopRecording" />
+
+    <SerialSequencePanel :statuses="sequences" :port="portName" :running="running && !stopping"
+      :busy="sequenceBusy" :error="sequenceError" @start="startSequence" @stop="stopSequence" />
+
+    <SerialSendExtras :port="portName" :ports="activeConfigs.map(item => String(item.port))"
+      :running="running && !stopping" :file-active="sequences[portName]?.active === true" :busy="extrasBusy"
+      :error="extrasError" :notice="extrasNotice" :results="broadcastResults" @broadcast="broadcast" @file="sendRawFile" />
+    </div>
 
     <div class="serial-toolbar">
       <div class="view-mode-switch" role="group" :aria-label="tr('显示模式', 'Display mode')">
@@ -150,7 +176,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { Download, RefreshCw, ScrollText, SquareTerminal, Trash2 } from '@lucide/vue'
+import { ChevronDown, Download, RefreshCw, ScrollText, SlidersHorizontal, SquareTerminal, Trash2 } from '@lucide/vue'
 import { useBinaryStream } from '../../composables/useBinaryStream'
 import { useMklinkApi } from '../../composables/useMklinkApi'
 import { useToast } from '../../composables/useToast'
@@ -170,13 +196,25 @@ import RttTransmitBar from './RttTransmitBar.vue'
 import SetupHint from './SetupHint.vue'
 import VirtualLogPanel, { type VirtualLogInput } from './VirtualLogPanel.vue'
 import { API_BASE } from '../../lib/runtimeEndpoint'
+import SerialAutomationPanel, { type SerialAutomation, type SerialParsedFrame } from './SerialAutomationPanel.vue'
+
+import SerialRecordingPanel, { type SerialRecordingStatus, type SerialRecordingRequest } from './SerialRecordingPanel.vue'
+
+import SerialSequencePanel, { type SerialSequenceStatus, type SerialSequenceRequest } from './SerialSequencePanel.vue'
+
+import SerialSendExtras, { type BroadcastResult } from './SerialSendExtras.vue'
 
 interface SerialStatus {
+  send_sequences?: Record<string, SerialSequenceStatus>
+  recording?: SerialRecordingStatus
   running?: boolean
   ports?: Record<string, string>
   config?: Array<Record<string, unknown>>
   stats?: typeof stats.value
   ymodem?: YmodemStatus
+  automation?: SerialAutomation
+  latest_frames?: Record<string, SerialParsedFrame>
+  session?: string | null
 }
 
 interface YmodemStatus {
@@ -218,7 +256,7 @@ const idleYmodemStatus = (): YmodemStatus => ({
 
 const baudrates = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
 const toast = useToast()
-const { listPorts: fetchPorts } = useMklinkApi()
+const { listUartPorts: fetchPorts } = useMklinkApi()
 const logBinary = useBinaryStream('serial', {
   capacity: 5000, channelCount: 1, decoderMode: 'serial-log',
 })
@@ -227,6 +265,24 @@ const terminalBinary = useBinaryStream('serial', {
 })
 const ports = ref<PortInfo[]>([])
 const portName = ref('')
+const activeConfigs = ref<Array<Record<string, unknown>>>([])
+const selectablePorts = computed(() => running.value
+  ? activeConfigs.value.map(item => ({ device: String(item.port), description: '' })) : ports.value)
+let displayedSource = ''
+watch(portName, port => {
+  logBinary.selectSerialPort(port)
+  terminalBinary.selectSerialPort(port)
+  displayedSource = ''
+  logPanel.value?.clear()
+  terminalPanel.value?.clear()
+  const config = activeConfigs.value.find(item => item.port === port)
+  if (config) {
+    baudrate.value = Number(config.baudrate)
+    databits.value = Number(config.databits)
+    stopbits.value = Number(config.stopbits)
+    parity.value = String(config.parity)
+  }
+}, { flush: 'sync' })
 const baudrate = ref(115200)
 const databits = ref(8)
 const stopbits = ref(1)
@@ -239,6 +295,31 @@ const portsLoaded = ref(false)
 const stats = ref({ rx_count: 0, tx_count: 0, rx_bytes: 0, tx_bytes: 0, bytes_per_sec: 0 })
 const portStatuses = ref<Record<string, string>>({})
 const runtimeError = ref('')
+const recording = ref<SerialRecordingStatus>({ state: 'idle', active: false })
+const recordingBusy = ref(false), recordingError = ref('')
+const sequences = ref<Record<string, SerialSequenceStatus>>({})
+const sequenceBusy = ref(false), sequenceError = ref('')
+const extrasBusy = ref(false), extrasError = ref(''), extrasNotice = ref('')
+const broadcastResults = ref<Record<string, BroadcastResult> | null>(null)
+const automation = ref<SerialAutomation>({ profile: null, rules: [] })
+const extensionsOpen = ref(false)
+const extensionsStatus = computed(() => {
+  if (recordingError.value || recording.value.error || sequenceError.value || extrasError.value
+    || Object.values(sequences.value).some(sequence => sequence.error)) return tr('需查看', 'Check status')
+  const labels = []
+  if (recording.value.active) labels.push(tr('记录中', 'Recording'))
+  if (Object.values(sequences.value).some(sequence => sequence.active)) labels.push(tr('队列执行中', 'Sequence running'))
+  if (running.value && (automation.value.profile || automation.value.rules.length)) labels.push(tr('协议已启用', 'Protocol enabled'))
+  return labels.join(' · ')
+})
+const automationEdited = ref(false)
+const latestFrames = ref<Record<string, SerialParsedFrame>>({})
+function editAutomation(value: SerialAutomation): void {
+  if (running.value || starting.value || stopping.value) return
+  automation.value = value
+  automationEdited.value = true
+  latestFrames.value = {}
+}
 const viewMode = ref<'log' | 'terminal'>('terminal')
 const logDisplayMode = ref<LogDisplayMode>('text')
 const showLogTimestamp = ref(false)
@@ -262,6 +343,7 @@ let lastYmodemTerminalKey = ''
 let reportedYmodemFinal = 0
 let ymodemTraceCursor = 0
 let ymodemTraceTransferId = 0
+let observedSerialSession: string | null = null
 
 const currentPortStatus = computed(() => portStatuses.value[portName.value] || (running.value ? 'opening' : 'closed'))
 const validBaudrate = computed(() => {
@@ -281,7 +363,7 @@ const localizedPortStatus = computed(() => {
 const ymodemActive = computed(() => ymodemStatus.value.active)
 const transmitEnabled = computed(() => (
   running.value && currentPortStatus.value === 'open'
-  && !ymodemActive.value && !ymodemStarting.value
+  && !(ymodemActive.value && ymodemStatus.value.port === portName.value) && !ymodemStarting.value
 ))
 const activeTelemetry = computed(() => (
   viewMode.value === 'log' ? logBinary.telemetry.value : terminalBinary.telemetry.value
@@ -323,7 +405,7 @@ async function refreshPorts(): Promise<void> {
   refreshingPorts.value = true
   try {
     ports.value = await fetchPorts()
-    if (!portName.value || !ports.value.some(port => port.device === portName.value)) {
+    if (!running.value && (!portName.value || !ports.value.some(port => port.device === portName.value))) {
       portName.value = ports.value[0]?.device || ''
     }
   } catch (caught) {
@@ -335,7 +417,18 @@ async function refreshPorts(): Promise<void> {
 }
 
 function applyStatus(status: SerialStatus): void {
+  if (status.session && status.session !== observedSerialSession) {
+    observedSerialSession = status.session
+    runtimeError.value = ''
+  }
+  if (status.send_sequences) sequences.value = status.send_sequences
+  if (status.recording) recording.value = status.recording
   running.value = status.running === true
+  if (running.value || !automationEdited.value) {
+    if (status.automation) automation.value = status.automation
+    latestFrames.value = status.latest_frames || {}
+    if (running.value) automationEdited.value = false
+  }
   if (status.stats) stats.value = status.stats
   portStatuses.value = status.ports || {}
   if (status.ymodem) {
@@ -344,7 +437,8 @@ function applyStatus(status: SerialStatus): void {
       ymodemTimer = setTimeout(pollYmodemStatus, 0)
     }
   }
-  const config = status.config?.[0]
+  activeConfigs.value = status.config || []
+  const config = activeConfigs.value.find(item => item.port === portName.value) || activeConfigs.value[0]
   if (running.value && config) {
     if (typeof config.port === 'string') portName.value = config.port
     if (typeof config.baudrate === 'number') baudrate.value = config.baudrate
@@ -512,12 +606,10 @@ async function startYmodem(): Promise<void> {
     `\r\n[YMODEM] 准备发送 ${file.name}（${file.size} B）…\r\n`,
     `\r\n[YMODEM] Preparing ${file.name} (${file.size} B)…\r\n`,
   ))
-  const form = new FormData()
-  form.append('file', file, file.name)
   try {
     const status = await requestJson(
-      `/api/dash/serial/ymodem/start?port=${encodeURIComponent(portName.value)}`,
-      { method: 'POST', body: form },
+      `/api/dash/serial/ymodem/start?port=${encodeURIComponent(portName.value)}&filename=${encodeURIComponent(file.name)}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file },
     )
     applyYmodemStatus(status)
     void pollYmodemStatus()
@@ -546,6 +638,58 @@ async function cancelYmodem(): Promise<void> {
   }
 }
 
+async function changeRecording(action: 'start' | 'stop', request?: SerialRecordingRequest): Promise<void> {
+  if (recordingBusy.value) return
+  recordingBusy.value = true
+  recordingError.value = ''
+  try {
+    recording.value = await requestJson(`/api/dash/serial/recording/${action}`, {
+      method: 'POST', ...(request ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) } : {}),
+    })
+  } catch (caught) {
+    recordingError.value = caught instanceof Error ? caught.message : String(caught)
+  } finally {
+    await refreshStatus()
+    recordingBusy.value = false
+  }
+}
+function startRecording(request: SerialRecordingRequest): Promise<void> { return changeRecording('start', request) }
+function stopRecording(): Promise<void> { return changeRecording('stop') }
+
+async function changeSequence(action: 'start' | 'stop', request: SerialSequenceRequest | {port: string}): Promise<void> {
+  if (sequenceBusy.value) return
+  sequenceBusy.value = true
+  sequenceError.value = ''
+  try {
+    await requestJson(`/api/dash/serial/sequence/${action}`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) })
+  } catch (caught) {
+    sequenceError.value = caught instanceof Error ? caught.message : String(caught)
+  } finally {
+    await refreshStatus()
+    sequenceBusy.value = false
+  }
+}
+function startSequence(request: SerialSequenceRequest): Promise<void> { return changeSequence('start', request) }
+function stopSequence(port: string): Promise<void> { return changeSequence('stop', { port }) }
+
+async function submitExtra(path: string, init: RequestInit, isFile: boolean): Promise<void> {
+  if (extrasBusy.value) return
+  extrasBusy.value = true; extrasError.value = ''; extrasNotice.value = ''; broadcastResults.value = null
+  try {
+    const result = await requestJson(path, init)
+    if (isFile) extrasNotice.value = tr(`已提交 ${result.bytes} B，请查看命令队列状态。`, `Queued ${result.bytes} B; see command sequence status.`)
+    else broadcastResults.value = result.results
+  } catch (caught) { extrasError.value = caught instanceof Error ? caught.message : String(caught) }
+  finally { await refreshStatus(); extrasBusy.value = false }
+}
+function broadcast(request: {data: string; hex: boolean}): Promise<void> {
+  return submitExtra('/api/dash/serial/broadcast', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(request)}, false)
+}
+function sendRawFile(file: File, hex: boolean, port: string): Promise<void> {
+  return submitExtra(`/api/dash/serial/file/upload?port=${encodeURIComponent(port)}&hex=${hex}`, {method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:file}, true)
+}
+
 async function refreshStatus(): Promise<void> {
   try {
     applyStatus(await requestJson('/api/dash/serial/status'))
@@ -566,6 +710,9 @@ async function doStart(): Promise<void> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        ...(automation.value.profile || automation.value.rules.length ? {
+          profile: automation.value.profile, auto_reply_rules: automation.value.rules,
+        } : {}),
         ports: [{
           port: portName.value,
           baudrate: validBaudrate.value,
@@ -603,7 +750,6 @@ async function doStop(): Promise<void> {
     await requestJson('/api/dash/serial/stop', { method: 'POST' })
     running.value = false
     portStatuses.value = {}
-    detachBinaryStreams()
     toast.info(tr('串口助手已停止', 'Serial Assistant stopped'))
   } catch (caught) {
     runtimeError.value = caught instanceof Error ? caught.message : String(caught)
@@ -614,10 +760,8 @@ async function doStop(): Promise<void> {
 }
 
 function syncBinaryStream(): void {
-  if (!running.value) {
-    detachBinaryStreams()
-    return
-  }
+  // Subscribe while idle as well: API-started sessions may emit their entire
+  // first response before the next status poll. This never opens the UART.
   if (attachedMode === viewMode.value) return
   if (attachedMode === 'log') logBinary.stop()
   else if (attachedMode === 'terminal') terminalBinary.stop()
@@ -632,12 +776,23 @@ function detachBinaryStreams(): void {
   attachedMode = null
 }
 
+function acceptSerialSource(source: { port: string; session: string }): boolean {
+  if (source.port !== portName.value) return false
+  const key = `${source.session}:${source.port}`
+  if (displayedSource !== key) {
+    displayedSource = key
+    logPanel.value?.clear()
+    terminalPanel.value?.clear()
+  }
+  return true
+}
+
 watch(() => terminalBinary.serialTerminal.value, chunk => {
-  if (viewMode.value === 'terminal' && chunk?.text) terminalPanel.value?.write(chunk.text)
+  if (viewMode.value === 'terminal' && chunk?.text && acceptSerialSource(chunk)) terminalPanel.value?.write(chunk.text)
 })
 
 watch(() => logBinary.serialLines.value, batch => {
-  if (viewMode.value !== 'log' || !batch) return
+  if (viewMode.value !== 'log' || !batch || !acceptSerialSource(batch)) return
   logPanel.value?.append(batch.lines.map(line => ({
     time: line.timestampNs,
     level: line.direction === 'RX' ? 'data' : 'warning',
@@ -722,6 +877,7 @@ function visibleAscii(value: string): string {
 }
 
 onMounted(async () => {
+  syncBinaryStream()
   await refreshPorts()
   await refreshStatus()
   void pollStatus()
@@ -738,12 +894,17 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.serial-assistant { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; flex-direction: column; }
+.serial-assistant { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; flex-direction: column; overflow-y: auto; }
 .serial-config-row { display: flex; flex-wrap: wrap; align-items: end; gap: 7px; }
 .serial-config-row label { display: grid; gap: 3px; color: var(--muted); font-size: 11px; }
 .serial-config-row select, .serial-config-row input { height: 30px; min-width: 64px; max-width: 220px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: inherit; }
 .serial-config-row input { width: 90px; }
 .serial-config-row label:first-child select { width: 180px; }
+.serial-extensions-toggle { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; min-height: 30px; padding: 4px 9px; border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; }
+.serial-extensions-toggle:hover, .serial-extensions-toggle.active { color: var(--accent); border-color: var(--accent); }
+.serial-extensions-toggle .rotated { transform: rotate(180deg); }
+.extensions-status { color: var(--accent); }
+.serial-extensions { flex: 0 0 auto; margin-top: 8px; }
 .serial-toolbar { display: flex; min-width: 0; align-items: center; gap: 10px; margin-top: 8px; }
 .ymodem-bar { display: grid; grid-template-columns:auto auto auto minmax(120px,1fr) auto auto; align-items:center; gap:7px; margin-top:8px; padding:7px 8px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); font-size:11px; }
 .ymodem-bar strong { color:var(--accent); letter-spacing:.04em; }

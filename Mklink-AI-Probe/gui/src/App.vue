@@ -1,5 +1,6 @@
 <template>
   <div class="app-root">
+    <RemoteSessionBar v-if="IS_REMOTE" />
     <header class="app-header">
       <h1 class="app-title">MKLink</h1>
       <nav class="app-nav">
@@ -36,6 +37,15 @@
         </details>
       </nav>
       <div class="header-right">
+        <label class="theme-setting">
+          <span>{{ tr('主题', 'Theme') }}</span>
+          <select data-testid="theme-select" :aria-label="tr('界面主题', 'Appearance theme')"
+            :value="themePreference" @change="setTheme(($event.target as HTMLSelectElement).value as ThemePreference)">
+            <option value="system">{{ tr('跟随系统', 'System') }}</option>
+            <option value="light">{{ tr('浅色', 'Light') }}</option>
+            <option value="dark">{{ tr('暗黑', 'Dark') }}</option>
+          </select>
+        </label>
         <button
           class="language-toggle"
           type="button"
@@ -51,7 +61,7 @@
       </div>
     </header>
     <AppUpdateBanner
-      v-if="!updateDismissed"
+      v-if="!IS_REMOTE && !updateDismissed"
       :state="updateState"
       :version="updateVersion"
       :progress="updateProgress"
@@ -60,7 +70,15 @@
       @retry="retryUpdate"
       @dismiss="updateDismissed = true"
     />
-    <div class="app-main">
+    <div v-if="initialBackendReady && backendState === 'dead'" class="backend-interrupted alert-error" data-testid="backend-interrupted" role="alert">
+      <div>
+        <strong>{{ recoveryTitle }}</strong>
+        <p>{{ tr('页面保留的是此前的数据，当前未确认实时状态。', 'The page retains previous data; live status is currently unconfirmed.') }}</p>
+        <p v-if="!isTauri">{{ recoveryHint }}</p>
+      </div>
+      <button class="btn" data-testid="backend-recheck" @click="refreshHealth">{{ tr('重新检查', 'Check Again') }}</button>
+    </div>
+    <div class="app-main" :inert="IS_REMOTE && backendState !== 'alive'">
       <DashboardView v-if="initialBackendReady && dashboardVisited" v-show="currentTab === 'dashboard'" />
       <router-view v-if="initialBackendReady" v-slot="{ Component, route: viewRoute }">
         <!-- Override the shared v-if branch key so cached flash pages stay distinct. -->
@@ -72,11 +90,19 @@
         {{ tr('正在启动本地服务…', 'Starting local service…') }}
       </div>
       <div v-else class="backend-recovery" role="alert">
-        <strong>{{ tr('本地服务未启动', 'Local service is not running') }}</strong>
-        <button data-testid="backend-restart" @click="restart">{{ tr('重启服务', 'Restart Service') }}</button>
+        <div>
+          <strong>{{ recoveryTitle }}</strong>
+          <p v-if="!isTauri">{{ recoveryHint }}</p>
+        </div>
+        <button v-if="isTauri" data-testid="backend-restart" @click="restart">{{ tr('重启服务', 'Restart Service') }}</button>
+        <button v-else data-testid="backend-recheck" @click="refreshHealth">{{ tr('重新检查', 'Check Again') }}</button>
       </div>
     </div>
     <footer class="app-footer">
+      <span v-if="sharedRuntime" data-testid="shared-runtime-status"
+        :title="tr('还有其他客户端时后台继续运行；全部退出且无在途任务后约5秒自动停止采集并释放下载器。', 'The backend stays alive for other clients. About 5 seconds after all clients leave and pending work completes, it stops capture and releases the probe.')">
+        {{ IS_REMOTE ? tr('远程会话 · 固定目标 · 不回退本地', 'Remote session · Fixed target · No local fallback') : tr('共享后台 · CDC · GUI / AI 共用连接', 'Shared backend · CDC · GUI / AI connection') }}
+      </span>
       <VersionHistoryPopover :version="appVersion" :build-commit="buildCommit" />
     </footer>
     <ToastContainer />
@@ -84,9 +110,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
+import { nextTick, computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { Languages } from '@lucide/vue'
+import { IS_REMOTE } from './lib/runtimeEndpoint'
+import RemoteSessionBar from './components/RemoteSessionBar.vue'
 import StatusBar from './components/StatusBar.vue'
 import ToastContainer from './components/ToastContainer.vue'
 import AppUpdateBanner from './components/AppUpdateBanner.vue'
@@ -95,7 +123,9 @@ import { useMklinkApi } from './composables/useMklinkApi'
 import { useBackendHealth } from './composables/useBackendHealth'
 import { useAppUpdater } from './composables/useAppUpdater'
 import { language, toggleLanguage, tr } from './composables/useLanguage'
+import { themePreference, setTheme, type ThemePreference } from './composables/useTheme'
 import { startBrowserSessionLease } from './lib/browserSessionLease'
+import { startSharedRuntimeView } from './lib/sharedRuntimeView'
 
 const router = useRouter()
 // Stream viewers use persistent DOM references while sampling in the background.
@@ -103,7 +133,13 @@ const router = useRouter()
 const DashboardView = defineAsyncComponent(() => import('./views/DashboardView.vue'))
 const route = useRoute()
 const { startStatusPolling, stopStatusPolling } = useMklinkApi()
-const { backendState, startHealthPolling, stopHealthPolling, restart, isTauri } = useBackendHealth()
+const { backendState, sharedRuntime, authenticationRequired, startHealthPolling, stopHealthPolling, restart, refreshHealth, isTauri } = useBackendHealth()
+const recoveryTitle = computed(() => authenticationRequired.value
+  ? tr('当前页面授权已失效', 'This page is no longer authorized')
+  : tr('无法连接本地服务', 'Cannot reach the local service'))
+const recoveryHint = computed(() => authenticationRequired.value
+  ? tr('请重新运行 mklink gui --probe <下载器 ID 或别名>，使用新链接打开对应下载器。', 'Run mklink gui --probe <probe ID or alias> again and open the new link for that probe.')
+  : tr('连接恢复后会自动更新；若后台已退出，请重新运行 mklink gui --probe <下载器 ID 或别名>。', 'Updates resume when the connection returns. If the backend has exited, run mklink gui --probe <probe ID or alias> again.'))
 const {
   state: updateState,
   version: updateVersion,
@@ -116,7 +152,18 @@ const {
 const initialBackendReady = ref(false)
 const updateDismissed = ref(false)
 let statusPollingStarted = false
-let stopBrowserSessionLease: () => void = () => undefined
+let stopWindowLease: () => void = () => undefined
+let windowLeaseMode: boolean | undefined
+watch(() => backendState.value === 'alive' ? sharedRuntime?.value === true : undefined, shared => {
+  if (shared === undefined || shared === windowLeaseMode) return
+  stopWindowLease()
+  windowLeaseMode = shared
+  stopWindowLease = shared || IS_REMOTE ? startSharedRuntimeView(async tab => {
+    await router.push({ name: 'dashboard', query: { tab } })
+    await nextTick()
+    if (router.currentRoute.value.name !== 'dashboard' || router.currentRoute.value.query.tab !== tab) throw new Error('Navigation was not applied')
+  }) : startBrowserSessionLease(!isTauri)
+}, { immediate: true })
 const appVersion = __APP_VERSION__
 const buildCommit = __APP_BUILD_COMMIT__
 
@@ -124,13 +171,13 @@ const currentTab = computed(() => route.name as string)
 const dashboardVisited = ref(false)
 watch(currentTab, name => { if (name === 'dashboard') dashboardVisited.value = true }, { immediate: true })
 
-const tabs = computed(() => [
+const tabs = computed(() => (IS_REMOTE ? [{ key: 'dashboard', label: tr('仪表盘', 'Dashboard') }] : [
   { key: 'config', label: tr('配置', 'Config') },
   { key: 'dashboard', label: tr('仪表盘', 'Dashboard') },
   { key: 'offline-flash', label: tr('脱机烧录', 'Offline Flash') },
   { key: 'online-flash', label: tr('在线烧录', 'Online Flash') },
-  { key: 'site-agent', label: tr('现场 Agent', 'Site Agent') },
-].filter(entry => entry.key !== 'site-agent' || isTauri))
+  { key: 'remote-service', label: tr('远程服务', 'Remote Service') },
+]))
 
 function navigate(key: string) {
   router.push({ name: key })
@@ -146,14 +193,13 @@ watch(backendState, state => {
 }, { immediate: true })
 
 onMounted(() => {
-  stopBrowserSessionLease = startBrowserSessionLease(!isTauri)
   startHealthPolling(5000)
   void checkForUpdates()
 })
 onUnmounted(() => {
   if (statusPollingStarted) stopStatusPolling()
   stopHealthPolling()
-  stopBrowserSessionLease()
+  stopWindowLease()
 })
 </script>
 
@@ -198,7 +244,7 @@ body {
   align-items: center;
   gap: 16px;
   flex-shrink: 0;
-  height: 48px;
+  height: 56px;
 }
 .app-title {
   font-size: 17px;
@@ -214,18 +260,20 @@ body {
 .nav-tab {
   background: none;
   border: none;
-  padding: 12px 18px;
+  padding: 10px 14px;
   font-size: 13px;
   font-weight: 500;
   color: var(--muted);
   cursor: pointer;
   border-bottom: 2px solid transparent;
-  transition: all 0.15s;
+  transition: color .15s, background-color .15s, border-color .15s;
   font-family: var(--font-body);
   white-space: nowrap;
 }
 .nav-tab:hover { color: var(--fg); border-bottom-color: var(--border); }
 .nav-tab.active {
+  background: var(--accent-bg);
+  border-radius: 7px 7px 0 0;
   color: var(--accent);
   border-bottom-color: var(--accent);
   font-weight: 600;
@@ -300,7 +348,7 @@ body {
   white-space: nowrap;
 }
 .language-toggle:hover { color: var(--accent); border-color: var(--accent); }
-@media (max-width: 720px) {
+@media (max-width: 1120px) {
   .app-header {
     height: auto;
     min-height: 48px;
@@ -358,6 +406,15 @@ body {
   gap: 12px;
   color: var(--danger);
 }
+.backend-interrupted {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 20px;
+  flex-shrink: 0;
+  font-size: 13px;
+}
 .backend-recovery button {
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -367,8 +424,8 @@ body {
   cursor: pointer;
 }
 .app-footer {
-  flex: 0 0 22px;
-  min-height: 22px;
+  flex: 0 0 28px;
+  min-height: 28px;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -389,17 +446,17 @@ body {
   letter-spacing: 0.02em;
   display: inline-block;
 }
-.badge-ok    { background: #e6f2ea; color: var(--success); }
-.badge-warn  { background: #f5f0e1; color: var(--warn); }
-.badge-info  { background: #e6eef5; color: var(--info); }
-.badge-err   { background: #f5e6e6; color: var(--danger); }
-.badge-accent { background: #f3ece6; color: var(--accent); font-weight: 600; }
+.badge-ok    { background: var(--success-bg); color: var(--success); }
+.badge-warn  { background: var(--warn-bg); color: var(--warn); }
+.badge-info  { background: var(--info-bg); color: var(--info); }
+.badge-err   { background: var(--danger-bg); color: var(--danger); }
+.badge-accent { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
 
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 16px 20px;
+  border-radius: var(--radius-lg);
+  padding: 20px 24px;
 }
 .card + .card { margin-top: 16px; }
 .card-title {
@@ -428,18 +485,18 @@ body {
   padding: 0 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: #fff;
+  background: var(--input-bg, #fff);
   font-size: 13px;
   color: var(--fg);
   font-family: var(--font-body);
   outline: none;
   transition: border-color 0.15s;
 }
-.form-input:focus, .form-select:focus { border-color: var(--accent); }
+.form-input:focus, .form-select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
 .form-select { cursor: pointer; }
 
 .btn {
-  height: 30px;
+  height: 34px;
   padding: 0 14px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -448,7 +505,7 @@ body {
   font-weight: 500;
   color: var(--fg);
   cursor: pointer;
-  transition: all 0.15s;
+  transition: color .15s, background-color .15s, border-color .15s;
   font-family: var(--font-body);
   white-space: nowrap;
 }
@@ -462,9 +519,9 @@ body {
 .btn-primary:hover { background: var(--accent-light); color: #fff; }
 .btn-danger { color: var(--danger); border-color: var(--danger); }
 .btn-danger:hover { background: var(--danger); color: #fff; }
-.btn-sm { height: 26px; padding: 0 10px; font-size: 11px; }
+.btn-sm { height: 30px; padding: 0 10px; font-size: 11px; }
 
-.btn-group { display: flex; gap: 6px; }
+.btn-group { display: flex; flex-wrap: wrap; gap: 8px; }
 
 .alert {
   padding: 10px 14px;
@@ -472,10 +529,10 @@ body {
   font-size: 13px;
   margin-bottom: 12px;
 }
-.alert-success { background: #e6f2ea; color: var(--success); }
-.alert-warn    { background: #f5f0e1; color: var(--warn); }
-.alert-error   { background: #f5e6e6; color: var(--danger); }
-.alert-info    { background: #e6eef5; color: var(--info); }
+.alert-success { background: var(--success-bg); color: var(--success); }
+.alert-warn    { background: var(--warn-bg); color: var(--warn); }
+.alert-error   { background: var(--danger-bg); color: var(--danger); }
+.alert-info    { background: var(--info-bg); color: var(--info); }
 
 .grid-2 {
   display: grid;
@@ -523,7 +580,7 @@ body {
   color: var(--muted);
   cursor: pointer;
   border-bottom: 2px solid transparent;
-  transition: all 0.15s;
+  transition: color .15s, background-color .15s, border-color .15s;
   font-family: var(--font-body);
   white-space: nowrap;
 }
@@ -542,5 +599,12 @@ pre.log-box {
   white-space: pre-wrap;
   word-break: break-all;
   line-height: 1.6;
+}
+@media (max-width: 600px) {
+  .app-main { padding: 12px; }
+  .card { padding: 14px; }
+  .form-row { flex-wrap: wrap; }
+  .form-label { width: 100%; text-align: left; }
+  .app-footer { flex-wrap: wrap; gap: 2px 10px; height: auto; font-size: 9px; }
 }
 </style>

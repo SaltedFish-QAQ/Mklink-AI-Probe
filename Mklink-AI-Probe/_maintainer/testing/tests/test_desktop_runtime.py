@@ -126,7 +126,8 @@ def _stop_process(process: subprocess.Popen) -> None:
         process.wait(timeout=5)
 
 
-def test_two_desktop_sidecars_get_independent_endpoints(tmp_path):
+def test_two_desktop_sidecars_get_independent_endpoints(tmp_path, monkeypatch):
+    monkeypatch.setenv("MKLINK_RUNTIME_DIR", str(tmp_path / "shared-runtimes"))
     probe, preferred_port = _blocking_listener()
     probe.close()
     if preferred_port > 65525:
@@ -143,7 +144,7 @@ def test_two_desktop_sidecars_get_independent_endpoints(tmp_path):
                     sys.executable,
                     "-m",
                     "mklink",
-                    "serve",
+                    "desktop-proxy",
                     "--host",
                     "127.0.0.1",
                     "--port",
@@ -167,8 +168,19 @@ def test_two_desktop_sidecars_get_independent_endpoints(tmp_path):
             endpoints.append(endpoint)
 
         assert endpoints[0]["port"] != endpoints[1]["port"]
+        # No WebView has sent a presence request. Both native proxies must
+        # nevertheless keep the shared runtime alive past its idle deadline.
+        time.sleep(6)
+        _wait_for_health(endpoints[0]["port"], "desktop-instance-0")
         _stop_process(processes[0])
         _wait_for_health(endpoints[1]["port"], "desktop-instance-1")
     finally:
         for process in reversed(processes):
             _stop_process(process)
+        from mklink.runtime import running_runtimes
+        # Abrupt process death cannot release presence synchronously. Its
+        # normal TTL must expire; explicit stop correctly refuses live leases.
+        deadline = time.monotonic() + 15
+        while running_runtimes() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert not running_runtimes()

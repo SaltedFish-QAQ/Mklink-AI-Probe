@@ -87,8 +87,9 @@ export class OnlineFlashApiError extends Error {
   readonly owner: string | null
   readonly resource: string | null
   readonly detail: unknown
+  readonly notStarted: boolean
 
-  constructor(status: number, fallback: string, payload: unknown) {
+  constructor(status: number, fallback: string, payload: unknown, notStarted = false) {
     const detail = errorDetail(payload)
     super(errorMessage(detail, fallback || `HTTP ${status}`))
     this.name = 'OnlineFlashApiError'
@@ -97,22 +98,24 @@ export class OnlineFlashApiError extends Error {
     this.owner = stringField(detail, 'owner')
     this.resource = stringField(detail, 'resource')
     this.detail = detail
+    this.notStarted = notStarted
   }
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}, base = ONLINE_FLASH_BASE): Promise<T> {
   const isMultipart = options.body instanceof FormData
   const headers = new Headers(options.headers)
   if (!isMultipart && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
-  const response = await fetch(`${API_BASE}${ONLINE_FLASH_BASE}${path}`, {
+  const response = await fetch(`${API_BASE}${base}${path}`, {
     ...options,
     headers,
   })
   if (!response.ok) {
     const payload = await response.json().catch(() => null)
-    throw new OnlineFlashApiError(response.status, response.statusText, payload)
+    throw new OnlineFlashApiError(response.status, response.statusText, payload,
+      response.headers.get('X-MKLink-Submission') === 'not-started')
   }
   return response.json() as Promise<T>
 }
@@ -244,8 +247,9 @@ export function useOnlineFlashApi() {
     return request(`/targets?${params.toString()}`, { signal })
   }
 
-  function getTargetMemoryMap(partNumber: string): Promise<TargetMemoryRegion[]> {
-    return request(`/targets/${encoded(partNumber)}/memory-map`)
+  function getTargetMemoryMap(partNumber: string, algorithmId = ''): Promise<TargetMemoryRegion[]> {
+    const query = algorithmId ? `?algorithm_id=${encoded(algorithmId)}` : ''
+    return request(`/targets/${encoded(partNumber)}/memory-map${query}`)
   }
 
   function getTargetSecurity(partNumber: string): Promise<SecurityCapability> {
@@ -308,6 +312,7 @@ export function useOnlineFlashApi() {
     baseAddress?: number | string | null,
     signal?: AbortSignal,
     capturedFromTarget = false,
+    algorithmId = '',
   ): Promise<ImageInspection> {
     const body = new FormData()
     body.append('file', file)
@@ -316,6 +321,7 @@ export function useOnlineFlashApi() {
       body.append('base_address', String(baseAddress))
     }
     if (capturedFromTarget) body.append('captured_from_target', 'true')
+    if (algorithmId) body.append('algorithm_id', algorithmId)
     return request('/images/inspect', { method: 'POST', body, signal })
   }
 
@@ -324,12 +330,14 @@ export function useOnlineFlashApi() {
     partNumber: string,
     baseAddress?: number | string | null,
     signal?: AbortSignal,
+    algorithmId = '',
   ): Promise<ImageInspection> {
     return request('/images/inspect-path', {
       method: 'POST',
       body: JSON.stringify({
         path,
         part_number: partNumber,
+        algorithm_id: algorithmId || null,
         base_address: baseAddress === undefined || baseAddress === null ? null : String(baseAddress),
       }),
       signal,
@@ -364,12 +372,30 @@ export function useOnlineFlashApi() {
     }, onProgress)
   }
 
-  function createJob(job: JobRequest): Promise<JobCreateResult> {
-    return request('/jobs', { method: 'POST', body: JSON.stringify(job) })
+  async function createJob(job: JobRequest, requestId: string = crypto.randomUUID()): Promise<JobCreateResult> {
+    try {
+      return await request('/jobs', { method: 'POST', body: JSON.stringify(job),
+        headers: { 'X-MKLink-Request-Id': requestId } })
+    } catch (error) {
+      if (error instanceof Error) {
+        error.message += `; request_id=${requestId}`
+        throw error
+      }
+      throw new Error(`${String(error)}; request_id=${requestId}`)
+    }
   }
 
   function getActiveJob(): Promise<JobSnapshot | null> {
     return request('/jobs/active')
+  }
+
+  async function retainedJob(requestId: string) {
+    const payload = await request<{ jobs: Array<{
+      request_id: string; action: string; state: string; online_job_id?: string;
+      result: { job?: JobSnapshot; acquisition?: { errors: string[] } } | null; error: string | null;
+    }> }>('/jobs/', {}, '/api/runtime')
+    const job = payload.jobs.find(item => item.request_id === requestId && item.action === 'online_flash')
+    return job ?? null
   }
 
   function getJob(jobId: string): Promise<JobSnapshot> {
@@ -474,6 +500,7 @@ export function useOnlineFlashApi() {
     readMemoryStream,
     createJob,
     getActiveJob,
+    retainedJob,
     getJob,
     stopJob,
     subscribeJob,

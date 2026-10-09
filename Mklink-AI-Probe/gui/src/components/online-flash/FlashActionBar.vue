@@ -4,7 +4,7 @@ import { useConfirmation } from '../../composables/useConfirmation'
 import { Play, Square } from '@lucide/vue'
 import type { JobAction, JobState } from '../../types/onlineFlash'
 import { tr } from '../../composables/useLanguage'
-const props = defineProps<{ actions: JobAction[]; canStart: boolean; active: boolean; stopping: boolean; state: JobState | null; totalProgress: number; progressLabel?: string; progressState?: string; unlockEnabled?: boolean; lockEnabled?: boolean; securityReason?: string; unlockErasesEeprom?: boolean; unlockErasesBackupRegisters?: boolean }>()
+const props = defineProps<{ actions: JobAction[]; canStart: boolean; active: boolean; stopping: boolean; state: JobState | null; totalProgress: number; progressLabel?: string; progressState?: string; securityFamily?: string; unlockEnabled?: boolean; lockEnabled?: boolean; securityReason?: string; unlockErasesEeprom?: boolean; unlockErasesBackupRegisters?: boolean }>()
 const emit = defineEmits<{ actions: [actions: JobAction[]]; start: []; stop: [] }>()
 const confirm = useConfirmation()
 const confirming = ref(false)
@@ -16,6 +16,16 @@ function available(action: JobAction): boolean {
   return true
 }
 async function confirmSecurityAction(action: JobAction): Promise<boolean> {
+  if (props.securityFamily === 'nrf54l15-ctrl-ap') {
+    if (action === 'unlock') return confirm(tr(
+      'nRF54L15 CTRL-AP 恢复会永久擦除程序和 UICR 配置，之后需要重新烧录。确定勾选“解锁”？',
+      'nRF54L15 CTRL-AP recovery permanently erases program memory and UICR configuration. Reprogramming is required. Select Unlock?',
+    ))
+    if (action === 'lock') return confirm(tr(
+      'nRF54L15 加锁会在固件校验后写入 APPROTECT 和 SECUREAPPROTECT，复位后关闭调试访问。以后解锁会擦除程序和 UICR。确定勾选“加锁”？',
+      'nRF54L15 lock writes APPROTECT and SECUREAPPROTECT after firmware verification and disables debug access after reset. A later unlock erases program memory and UICR. Select Lock?',
+    ))
+  }
   const extraData = props.unlockErasesEeprom || props.unlockErasesBackupRegisters
   if (action === 'unlock') return confirm(tr(
     extraData
@@ -85,5 +95,5 @@ const totalPercent = computed(() => Math.round(Math.min(1, Math.max(0, props.tot
   </div>
 </template>
 <style scoped>
-.action-bar{display:flex;flex-wrap:wrap;max-width:100%;box-sizing:border-box;align-items:center;gap:12px;padding:10px 12px;border-top:1px solid var(--of-border);background:#1a1f25;font-size:10px}.action-choices{display:flex;flex-wrap:wrap;gap:7px}.action-choices label{display:flex;align-items:center;gap:3px;color:var(--of-muted)}.action-choices label.unavailable{opacity:.45;cursor:not-allowed}.progress-block{display:grid;flex:1 1 220px;min-width:180px;max-width:360px;gap:5px;margin-left:auto}.progress-meta{display:grid;grid-template-columns:auto minmax(58px,1fr) auto;align-items:center;gap:8px}.progress-title{color:var(--of-muted)}.progress-meta strong{color:var(--of-text);font-variant-numeric:tabular-nums}.progress-block progress{width:100%;height:7px;accent-color:var(--of-accent)}.progress-block progress::-webkit-progress-bar{border-radius:3px;background:#0f1317}.progress-block progress::-webkit-progress-value{border-radius:3px;background:var(--of-accent)}.state{overflow:hidden;color:var(--of-accent);font-weight:700;text-overflow:ellipsis;white-space:nowrap}.waiting{flex-basis:100%;color:var(--of-warn);text-align:right}.job-actions{display:flex;gap:7px}.job-actions button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:7px 10px;border:1px solid var(--of-border);border-radius:5px;background:var(--of-input);color:var(--of-text)}button.primary{border-color:var(--of-accent);background:#263648}button.stop{color:var(--of-danger)}button:disabled{opacity:.4}@media(max-width:720px){.progress-block{order:3;max-width:none;margin-left:0}.job-actions{margin-left:auto}}
+.action-bar{display:flex;flex-wrap:wrap;max-width:100%;box-sizing:border-box;align-items:center;gap:12px;padding:10px 12px;border-top:1px solid var(--of-border);background:var(--of-surface);font-size:10px}.action-choices{display:flex;flex-wrap:wrap;gap:7px}.action-choices label{display:flex;align-items:center;gap:3px;color:var(--of-muted)}.action-choices label.unavailable{opacity:.45;cursor:not-allowed}.progress-block{display:grid;flex:1 1 220px;min-width:180px;max-width:360px;gap:5px;margin-left:auto}.progress-meta{display:grid;grid-template-columns:auto minmax(58px,1fr) auto;align-items:center;gap:8px}.progress-title{color:var(--of-muted)}.progress-meta strong{color:var(--of-text);font-variant-numeric:tabular-nums}.progress-block progress{width:100%;height:7px;accent-color:var(--of-accent)}.progress-block progress::-webkit-progress-bar{border-radius:3px;background:var(--of-bg)}.progress-block progress::-webkit-progress-value{border-radius:3px;background:var(--of-accent)}.state{overflow:hidden;color:var(--of-accent);font-weight:700;text-overflow:ellipsis;white-space:nowrap}.waiting{flex-basis:100%;color:var(--of-warn);text-align:right}.job-actions{display:flex;gap:7px}.job-actions button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:7px 10px;border:1px solid var(--of-border);border-radius:5px;background:var(--of-input);color:var(--of-text)}button.primary{border-color:var(--of-accent);background:var(--info-bg)}button.stop{color:var(--of-danger)}button:disabled{opacity:.4}@media(max-width:720px){.progress-block{order:3;max-width:none;margin-left:0}.job-actions{margin-left:auto}}
 </style>

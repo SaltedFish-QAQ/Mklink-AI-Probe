@@ -189,6 +189,16 @@ var COLORS = [
 ];
 var GRID_COLOR = '#e8e6dc';
 var TEXT_DIM = '#87867f';
+var CHART_BG = '#faf9f5';
+var CROSSHAIR_COLOR = 'rgba(20,20,19,0.35)';
+function syncViewerTheme() {
+  var css = getComputedStyle(document.body);
+  GRID_COLOR = css.getPropertyValue('--chart-grid').trim() || '#e8e6dc';
+  TEXT_DIM = css.getPropertyValue('--chart-text').trim() || '#87867f';
+  CHART_BG = css.getPropertyValue('--chart-bg').trim() || '#faf9f5';
+  CROSSHAIR_COLOR = css.getPropertyValue('--chart-crosshair').trim() || 'rgba(20,20,19,0.35)';
+}
+syncViewerTheme();
 var MIN_POINTS = Number.isFinite(Number(CONFIG.minPoints)) ? Math.floor(Number(CONFIG.minPoints)) : 2;
 var MAX_POINTS = CONFIG.maxPoints;
 var MAX_BUFFER_POINTS = 1000000;
@@ -215,6 +225,10 @@ var viewerAbortController = new AbortController();
 function addViewerGlobalListener(target, type, listener) {
   target.addEventListener(type, listener, { signal: viewerAbortController.signal });
 }
+
+addViewerGlobalListener(window, 'mklink-theme-change', function() {
+  syncViewerTheme(); drawChart(); drawMinimap();
+});
 
 window.MAX_POINTS = MAX_POINTS;
 window.RING_BUFFER_CAPACITY = RING_BUFFER_CAPACITY;
@@ -324,12 +338,88 @@ var channelYState = {};  // { name: { zoom: 1, offset: 0, autoRange: true } }
 var selectedChannel = null;  // Channel under mouse for Y-axis zoom
 var splitChannelName = null;
 var chartPanelLayout = null;
+var watchWorkspace = IS_SUPERWATCH_MODE ? window.__MKLINK_WATCH_WORKSPACE__ || null : null;
+var workspaceY = Object.create(null);
+var workspaceSignature = null;
+function signalStyle(name) { return watchWorkspace && watchWorkspace.signals && watchWorkspace.signals[name] || {}; }
+function signalLabel(name) { return signalStyle(name).alias || name; }
+function setWorkspace(value) {
+  if (!IS_SUPERWATCH_MODE || !value || !Array.isArray(value.panes) || !value.panes.length) return;
+  var signature=JSON.stringify(value);
+  if (signature === workspaceSignature) return;
+  workspaceSignature=signature;
+  watchWorkspace = value;
+  var wrap=document.getElementById('chart-wrap');
+  if (wrap) {
+    var parent=wrap.parentElement;
+    if (parent) parent.style.overflowY='auto';
+  }
+  if (chartLegend) delete chartLegend.dataset.signature;
+  updateChartLegend(); drawChart();
+}
+function activeWorkspacePanes() {
+  if (!IS_SUPERWATCH_MODE || !watchWorkspace) return null;
+  var used=Object.create(null);
+  Object.keys(FIELDS).forEach(function(name) {
+    if (FIELDS[name].visible) used[signalStyle(name).pane || watchWorkspace.defaultGroup || watchWorkspace.panes[0].id]=true;
+  });
+  var active=watchWorkspace.panes.filter(function(p){return used[p.id];});
+  return active.length ? active : [watchWorkspace.panes.find(function(p){return p.id===watchWorkspace.defaultGroup;}) || watchWorkspace.panes[0]];
+}
+function syncWorkspaceDividers(panels) {
+  var host=document.getElementById('chart-wrap');
+  if (!host) return;
+  var controls=host.querySelectorAll('.workspace-divider');
+  if (controls.length !== panels.length-1) {
+    controls.forEach(function(el){el.remove();});
+    panels.slice(0,-1).forEach(function(panel,index){
+      var divider=document.createElement('div');
+      divider.className='workspace-divider';divider.setAttribute('role','separator');
+      divider.setAttribute('aria-label','Resize plot '+(index+1));divider.setAttribute('aria-orientation','horizontal');divider.tabIndex=0;
+      function resizeBy(delta) {
+        var panes=watchWorkspace.panes.map(function(p){return Object.assign({},p);});
+        var active=chartPanelLayout.panes;
+        var first=panes.find(function(p){return p.id===active[index].id;});
+        var second=panes.find(function(p){return p.id===active[index+1].id;});
+        var total=first.height+second.height;
+        first.height=Math.max(100,Math.min(total-100,first.height+delta));
+        second.height=total-first.height;
+        window.dispatchEvent(new CustomEvent('mklink:workspace-resize',{detail:panes}));
+      }
+      divider.addEventListener('keydown',function(e){if(e.key==='ArrowUp'||e.key==='ArrowDown'){e.preventDefault();resizeBy(e.key==='ArrowUp'?-20:20);}});
+      divider.addEventListener('mousedown',function(e){
+        e.preventDefault();var start=e.clientY;
+        var onUp=function(end){resizeBy(end.clientY-start);window.removeEventListener('mouseup',onUp);};
+        window.addEventListener('mouseup',onUp,{once:true,signal:viewerAbortController.signal});
+      });
+      host.appendChild(divider);
+    });
+    controls=host.querySelectorAll('.workspace-divider');
+  }
+  controls.forEach(function(el,index){el.style.top=(panels[index].top+panels[index].height+8)+'px';});
+}
+function panelForSignal(name) {
+  var panes = chartPanelLayout && chartPanelLayout.panes;
+  if (!panes) return null;
+  return panes.find(function(p) { return p.id === (signalStyle(name).pane || watchWorkspace.defaultGroup); }) || panes[0];
+}
+function workspaceRange(panel) {
+  if (workspaceY[panel.id]) return workspaceY[panel.id];
+  var low=Infinity, high=-Infinity;
+  Object.keys(FIELDS).forEach(function(name) {
+    if (!FIELDS[name].visible || panelForSignal(name).id !== panel.id) return;
+    var range=getChannelYRange(name);
+    if (range) { low=Math.min(low,range.yMin); high=Math.max(high,range.yMax); }
+  });
+  return Number.isFinite(low) ? {yMin:low,yMax:high} : {yMin:-1,yMax:1};
+}
 
 // Timeline navigation (Task 5I)
 var DEFAULT_TIMELINE_ZOOM = CONFIG.mode === 'SuperWatch' ? 2 : 1;
 var DEFAULT_TIMELINE_OFFSET = CONFIG.mode === 'SuperWatch' ? 1 : 0;
 var MAX_TIMELINE_ZOOM = CONFIG.mode === 'SuperWatch' ? 10000 : 100;
 var superwatchTimelineSpan = null;
+var superwatchTimelineUserAdjusted = false;
 var superwatchDefaultTimelineSpan = null;
 var superwatchTimelineCapturePending = false;
 var superwatchTimelineLag = 0;
@@ -346,6 +436,7 @@ function resetTimelineView() {
   timelineView.offset = DEFAULT_TIMELINE_OFFSET;
   if (IS_SUPERWATCH_MODE) {
     superwatchTimelineSpan = superwatchDefaultTimelineSpan;
+    superwatchTimelineUserAdjusted = false;
     superwatchTimelineLag = 0;
   }
 }
@@ -501,7 +592,7 @@ function updateChartLegend() {
     swatch.style.background = meta.color;
     var label = document.createElement('span');
     label.className = 'chart-legend-name';
-    label.textContent = name;
+    label.textContent = signalLabel(name); label.title = name; if (signalStyle(name).emphasis) label.style.fontWeight = 'bold';
     row.appendChild(swatch);
     row.appendChild(label);
     if (IS_SUPERWATCH_MODE) {
@@ -536,6 +627,10 @@ function updateSplitPanelControl(active, dividerY) {
 
 function setSplitChannel(name) {
   if (!IS_SUPERWATCH_MODE || !FIELDS[name] || !FIELDS[name].visible) return false;
+  if (watchWorkspace) {
+    window.dispatchEvent(new CustomEvent('mklink:workspace-split', {detail: {path: name}}));
+    return true;
+  }
   var names = visibleChartChannelNames();
   if (names.length < 2) return false;
   splitChannelName = (splitChannelName === name) ? null : name;
@@ -705,6 +800,7 @@ var IS_VOFA_MODE = CONFIG.mode === 'VOFA';
 var IS_SUPERWATCH_MODE = CONFIG.mode === 'SuperWatch';
 var IS_BINARY_WAVEFORM_MODE = IS_VOFA_MODE || IS_SUPERWATCH_MODE;
 var collectionState = 'stopped';
+var acquisitionState = 'stopped';
 var currentInterval = IS_SUPERWATCH_MODE ? 0.001 : 0;
 var intervalInput = document.getElementById('interval-input');
 var intervalDirty = false;
@@ -815,11 +911,25 @@ function superwatchErrorMessage(message, name) {
 
 function syncDashboardStatus(d) {
   if (!d) return;
+  if (IS_SUPERWATCH_MODE && Array.isArray(d.write_events)) {
+    superwatchWriteEvents = d.write_events.slice(-128);
+    superwatchWriteEvents.forEach(function(event) {
+      if (event.event_id > superwatchLastWriteEvent) {
+        appendRawLogLine(JSON.stringify(Object.assign({event: 'write'}, event)));
+        superwatchLastWriteEvent = event.event_id;
+      }
+    });
+    canvas.dataset.writeEventCount = String(superwatchWriteEvents.length);
+  }
   if (IS_VOFA_MODE && Array.isArray(d.channels)) {
     vofaChannels = normalizeVofaChannels(d.channels);
     notifyVofaChannels();
   }
   var nextState = d.state;
+  if (!nextState && d.running !== undefined) nextState = d.running ? 'running' : 'stopped';
+  if (nextState) acquisitionState = nextState;
+  // A shared stop ends this display pause too; the next shared start must be visible.
+  if (nextState === 'stopped') renderPaused = false;
   if (IS_BINARY_WAVEFORM_MODE && renderPaused && nextState === 'running') {
     nextState = 'paused';
   }
@@ -827,6 +937,7 @@ function syncDashboardStatus(d) {
     nextState = d.running ? (renderPaused ? 'paused' : 'running') : 'stopped';
   }
   updateCollectionUI(nextState || 'stopped');
+  if (typeof d.error === 'string' && d.error) showControlError(d.error);
   if (IS_VOFA_MODE) updateSampleRateBadge(d.interval, d.actual_rate, false);
   else if (IS_SUPERWATCH_MODE && Number.isFinite(Number(d.actual_rate))) {
     var actualRate = Number(d.actual_rate);
@@ -863,7 +974,9 @@ function updateCollectionUI(state) {
   if (state === 'running') {
     if (IS_SUPERWATCH_MODE && previousState !== 'running') {
       if (paused) discardPausedBinarySnapshot();
-      else resetTimelineView();
+      // Continue with the user's time scale, following the newest samples.
+      superwatchTimelineLag = 0;
+      timelineView.offset = 1;
     }
     clearFrozenView();
     if (Date.now() >= controlErrorUntil) {
@@ -903,12 +1016,16 @@ if (typeof window !== 'undefined') {
 
 document.getElementById('btn-start').addEventListener('click', function() {
   if (typeof CONFIG !== 'undefined' && CONFIG.deviceConnected === false) return;
+  if (IS_BINARY_WAVEFORM_MODE && renderPaused && acquisitionState === 'running') {
+    renderPaused = false;
+    updateCollectionUI('running');
+    return;
+  }
   renderPaused = false;
   var opts = {method:'POST'};
   if (IS_VOFA_MODE && vofaChannels.length > 0) {
     opts.headers = {'Content-Type': 'application/json'};
     opts.body = JSON.stringify({
-      channels: vofaChannels,
       interval: currentInterval > 0 ? currentInterval : 0.1
     });
   }
@@ -924,6 +1041,7 @@ document.getElementById('btn-start').addEventListener('click', function() {
         vofaChannels = normalizeVofaChannels(d.channels);
         notifyVofaChannels();
       }
+      acquisitionState = 'running';
       updateCollectionUI('running');
       notifyVofaStreamState('running');
       // Reconnect SSE if needed
@@ -955,6 +1073,7 @@ function stopCollection() {
     })
     .then(function(d){
       renderPaused = false;
+      acquisitionState = 'stopped';
       updateCollectionUI('stopped');
       notifyVofaStreamState('stopped');
     })
@@ -967,8 +1086,8 @@ var bufferInput = document.getElementById('buffer-input');
 bufferInput.addEventListener('input', updateBufferMemoryEstimate);
 updateBufferMemoryEstimate();
 document.getElementById('btn-apply-buffer').addEventListener('click', function() {
-  var val = parseInt(bufferInput.value, 10);
-  if (!Number.isFinite(val) || val < MIN_POINTS || val > MAX_BUFFER_POINTS) {
+  var val = bufferInput.valueAsNumber;
+  if (!Number.isInteger(val) || val < MIN_POINTS || val > MAX_BUFFER_POINTS) {
     alert('Buffer must be between ' + MIN_POINTS + ' and ' + MAX_BUFFER_POINTS + ' points per channel');
     return;
   }
@@ -1587,19 +1706,16 @@ function _buildWatchRowHtml(name, m) {
   if (treeNode) {
     hasChildren = treeNode.children && treeNode.children.length > 0
       && treeNode.kind !== 'bitfield' && !treeNode.enumValues;
-    console.log('[watch-row] name=' + name + ' treeNode found, hasChildren=' + hasChildren + ' children=' + (treeNode.children ? treeNode.children.length : 0) + ' kind=' + treeNode.kind);
   } else {
     // No cached tree: show expand button for struct-sourced items or top-level names
     var baseName = name.split('.')[0];
     var treeCached = !!_inspectCache[baseName];
     if (treeCached) {
       hasChildren = false; // tree exists but this path not found -> leaf
-      console.log('[watch-row] name=' + name + ' treeCached but path not found -> hasChildren=false');
     } else {
       // No tree cached yet: guess based on metadata / name pattern
       hasChildren = (CHANNEL_METADATA[name] && CHANNEL_METADATA[name].source === 'struct')
         || (name.indexOf('.') < 0);
-      console.log('[watch-row] name=' + name + ' no tree cached, guess hasChildren=' + hasChildren + ' source=' + (CHANNEL_METADATA[name] ? CHANNEL_METADATA[name].source : 'null'));
     }
   }
   var isExpanded = !!_expandedRows[name];
@@ -1621,7 +1737,7 @@ function _buildWatchRowHtml(name, m) {
   );
   return '<tr data-channel="' + escapeHtml(name) + '">' +
     '<td class="watch-col-delete"><button class="watch-delete-btn" data-name="' + escapeHtml(name) + '" title="Remove">&times;</button></td>' +
-    '<td data-col="name" class="' + watchColClass('name') + '" style="' + watchColStyle('name') + 'color:' + m.color + '"><span class="watch-name-cell">' + expandHtml + visHtml + '<span class="watch-name-text">' + escapeHtml(name) + '</span></span></td>' +
+    '<td data-col="name" class="' + watchColClass('name') + '" style="' + watchColStyle('name') + 'color:' + m.color + '"><span class="watch-name-cell">' + expandHtml + visHtml + '<span class="watch-name-text">' + escapeHtml(signalLabel(name)) + '</span></span></td>' +
     '<td data-col="type" class="' + watchColClass('type') + '" style="' + watchColStyle('type') + '">' + escapeHtml(typeText) + '</td>' +
     '<td data-col="value" class="' + valClass + watchColClass('value') + (_watchWrittenValues[name] ? ' watch-val-written' : '') + '" style="' + watchColStyle('value') + '"><span class="watch-value-cell"><span class="watch-value-text">' + escapeHtml(_watchWrittenValues[name] ? _watchWrittenValues[name].displayText : cur) + '</span>' + (isStruct ? '' : renderValueFormatSelect(name, m)) + '</span></td>' +
     '<td data-col="y" class="' + watchColClass('y') + '" style="' + watchColStyle('y') + '">' + yHtml + '</td>' +
@@ -1731,7 +1847,6 @@ function _rebuildWatchTable() {
   // Skip rebuild if any row is being edited (dblclick editing in progress)
   if (tbody.querySelector('tr.watch-editing')) return;
   var names = sortedFieldNames();
-  console.log('[rebuildWatch] names=' + names.join(', ') + ' expanded=' + Object.keys(_expandedRows).join(','));
   var html = '';
   for (var i = 0; i < names.length; i++) {
     var name = names[i];
@@ -1740,7 +1855,6 @@ function _rebuildWatchTable() {
     if (name.indexOf('.') >= 0) {
       var baseName = name.split('.')[0];
       if (FIELDS[baseName]) {
-        console.log('[rebuildWatch] skipping child ' + name + ' because parent ' + baseName + ' exists');
         continue;
       }
     }
@@ -1772,7 +1886,6 @@ function _bindWatchDelegates(tbody) {
       setChannelVisible(el.dataset.name, el.checked);
     } else if (el.classList.contains('watch-child-add-toggle')) {
       var childPath = el.dataset.childPath;
-      console.log('[watch-child-toggle] path=' + childPath + ' checked=' + el.checked);
       if (el.checked) {
         superwatchAddName(childPath);
       } else {
@@ -2027,7 +2140,6 @@ function applyChannelMetadata(channels, purge) {
   for (var name in channels) {
     if (!channels.hasOwnProperty(name)) continue;
     var meta = channels[name] || {};
-    console.log('[applyMeta] name=' + name + ' source=' + meta.source + ' isNew=' + !FIELDS[name] + ' purge=' + purge);
     CHANNEL_METADATA[name] = Object.assign({}, CHANNEL_METADATA[name] || {}, meta);
     if (!FIELDS[name]) {
       FIELDS[name] = {
@@ -2168,17 +2280,93 @@ function captureSuperwatchTimelineSpanIfReady() {
   }
   if (!(dataSpan > 0)) return false;
   superwatchDefaultTimelineSpan = dataSpan / DEFAULT_TIMELINE_ZOOM;
+  superwatchTimelineCapturePending = false;
+  // Learning the initial buffer duration must not overwrite a later user zoom.
+  // Keep the measured default available for an explicit axis reset.
+  if (superwatchTimelineUserAdjusted) return true;
   superwatchTimelineSpan = superwatchDefaultTimelineSpan;
   superwatchTimelineLag = 0;
-  superwatchTimelineCapturePending = false;
   timelineView.offset = 1;
   return true;
 }
 
-function setBufferCapacity(newCapacity) {
+var binaryCapacityRequester = null;
+var binaryCapacityPending = false;
+function setBinaryCapacityRequester(requester) {
+  binaryCapacityRequester = requester;
+  if (requester) setBufferCapacity(RING_BUFFER_CAPACITY);
+}
+
+function prepareBufferCapacity(newCapacity) {
+  var capacity = IS_SUPERWATCH_MODE && !binaryDetailEnabled ? SUPERWATCH_MAIN_RING_CAPACITY : newCapacity;
+  var prepared = Object.create(null);
+  for (var name in FIELDS) {
+    if (FIELDS.hasOwnProperty(name)) prepared[name] = new RingBuffer(capacity);
+  }
+  return { rings: prepared, committed: false };
+}
+
+function setBufferCapacity(newCapacity, confirmed, prepared) {
   newCapacity = Math.floor(Number(newCapacity));
   if (!Number.isFinite(newCapacity)) return false;
   newCapacity = Math.max(MIN_POINTS, Math.min(MAX_BUFFER_POINTS, newCapacity));
+  if (binaryCapacityPending && !confirmed) return false;
+  try { prepared = prepared || prepareBufferCapacity(newCapacity); }
+  catch (error) {
+    var rejectedInput = document.getElementById('buffer-input');
+    if (rejectedInput) rejectedInput.value = String(RING_BUFFER_CAPACITY);
+    updateBufferMemoryEstimate();
+    showControlError(error && error.message ? error.message : String(error));
+    return false;
+  }
+  if (binaryCapacityRequester && !confirmed) {
+    binaryCapacityPending = true;
+    var previousCapacity = RING_BUFFER_CAPACITY;
+    var workerConfirmed = false;
+    var recoveryFailed = false;
+    var button = document.getElementById('btn-apply-buffer');
+    if (button) button.disabled = true;
+    Promise.resolve().then(function() { return binaryCapacityRequester(newCapacity); })
+      .then(function() {
+        workerConfirmed = true;
+        if (!viewerAbortController.signal.aborted) setBufferCapacity(newCapacity, true, prepared);
+      })
+      .catch(function(error) {
+        if (viewerAbortController.signal.aborted) return;
+        // Rendering errors after commit must not roll back only the Worker.
+        return Promise.resolve().then(function() {
+          if (workerConfirmed && !prepared.committed) return binaryCapacityRequester(previousCapacity);
+        }).then(function() {
+          if (viewerAbortController.signal.aborted) return;
+          var input = document.getElementById('buffer-input');
+          if (input) input.value = String(RING_BUFFER_CAPACITY);
+          updateBufferMemoryEstimate();
+          showControlError(error && error.message ? error.message : String(error));
+        }).catch(function(restoreError) {
+          recoveryFailed = true;
+          if (viewerAbortController.signal.aborted) return;
+          var recoveryMessage = 'Capacity recovery failed; reload this view: ' + String(restoreError);
+          showControlError(recoveryMessage);
+          updateBinaryHealth({ phase: 'error', error: recoveryMessage });
+        });
+      })
+      .finally(function() {
+        binaryCapacityPending = recoveryFailed;
+        if (button) button.disabled = recoveryFailed;
+      });
+    return true;
+  }
+  // Refresh from current history after the asynchronous worker confirmation.
+  // Allocate any newly added channels before publishing any replacement.
+  var mainCapacity = IS_SUPERWATCH_MODE && !binaryDetailEnabled ? SUPERWATCH_MAIN_RING_CAPACITY : newCapacity;
+  for (var fieldName in FIELDS) {
+    if (!FIELDS.hasOwnProperty(fieldName)) continue;
+    if (!prepared.rings[fieldName] || prepared.rings[fieldName].capacity !== mainCapacity) prepared.rings[fieldName] = new RingBuffer(mainCapacity);
+    var source = FIELDS[fieldName].ringBuf;
+    var destination = prepared.rings[fieldName];
+    destination.clear();
+    for (var i = Math.max(0, source.count - mainCapacity); i < source.count; i++) destination.push(source.timeAt(i), source.valueAt(i));
+  }
   var visibleSpanBeforeResize = null;
   if (IS_SUPERWATCH_MODE) {
     var visibleBeforeResize = getVisibleTimeRange();
@@ -2196,8 +2384,9 @@ function setBufferCapacity(newCapacity) {
   if (input) input.value = String(newCapacity);
   for (var name in FIELDS) {
     if (!FIELDS.hasOwnProperty(name)) continue;
-    FIELDS[name].ringBuf = resizeRingBuffer(FIELDS[name].ringBuf, waveformMainRingCapacity());
+    FIELDS[name].ringBuf = prepared.rings[name];
   }
+  prepared.committed = true;
   if (IS_SUPERWATCH_MODE) {
     if (Number.isFinite(visibleSpanBeforeResize) && visibleSpanBeforeResize > 0) {
       superwatchTimelineSpan = visibleSpanBeforeResize;
@@ -2322,6 +2511,7 @@ function serializeState() {
     channels.push(ch);
   }
   var state = { channels: channels };
+  if (watchWorkspace) state.workspace = JSON.parse(JSON.stringify(watchWorkspace));
   state.splitChannel = splitChannelName;
   state.globalYView = {
     zoom: globalYView.zoom,
@@ -2353,6 +2543,7 @@ function deserializeState(json) {
   try {
     var state = (typeof json === 'string') ? JSON.parse(json) : json;
     if (!state || !state.channels) return false;
+    if (state.workspace) window.dispatchEvent(new CustomEvent('mklink:workspace-import', { detail: state.workspace }));
     globalYView = { zoom: 1, offset: 0, autoRange: true, manualMin: null, manualMax: null };
     splitChannelName = null;
     for (var i = 0; i < state.channels.length; i++) {
@@ -2412,7 +2603,8 @@ function deserializeState(json) {
       triggerSettings.edge = state.triggerSettings.edge || 'rising';
       triggerSettings.level = (state.triggerSettings.level !== undefined) ? state.triggerSettings.level : 0;
       triggerSettings.mode = state.triggerSettings.mode || 'auto';
-      triggerSettings.preTriggerSamples = (state.triggerSettings.preTrigger !== undefined) ? state.triggerSettings.preTrigger : 1000;
+      var preTrigger = state.triggerSettings.preTrigger;
+      triggerSettings.preTriggerSamples = validPreTriggerSamples(preTrigger) ? preTrigger : 1000;
       var srcSel = document.getElementById('trigger-source');
       if (srcSel) srcSel.value = triggerSettings.source;
       var edgeSel = document.getElementById('trigger-edge');
@@ -2440,6 +2632,11 @@ function deserializeState(json) {
 // ============================================================
 // CSV/PNG export
 // ============================================================
+function csvHeader(name, unit) {
+  var label=signalLabel(name);
+  var text=(label === name ? name : label+' ['+name+']')+(unit ? ' ('+unit+')' : '');
+  return /[,;"\n\r]/.test(text) ? '"'+text.replace(/"/g,'""')+'"' : text;
+}
 function exportCSV() {
   if (IS_SUPERWATCH_MODE && binaryHistoryRequester && !singleTriggerCaptureFrozen) {
     if (!binaryExportPending) {
@@ -2456,7 +2653,7 @@ function exportCSV() {
   if (csvCfg.includeTimestamp !== false) headers.push('timestamp');
   for (var i = 0; i < names.length; i++) {
     var ch = FIELDS[names[i]];
-    headers.push(names[i] + (ch.unit ? ' (' + ch.unit + ')' : ''));
+    headers.push(csvHeader(names[i], ch.unit));
   }
   var rows = [headers.join(delim)];
 
@@ -2531,7 +2728,7 @@ function exportBinaryHistorySnapshot(snapshot) {
   if (csvCfg.includeTimestamp !== false) headers.push('timestamp');
   for (var nameIndex = 0; nameIndex < names.length; nameIndex++) {
     var field = FIELDS[names[nameIndex]];
-    headers.push(names[nameIndex] + (field.unit ? ' (' + field.unit + ')' : ''));
+    headers.push(csvHeader(names[nameIndex], field.unit));
   }
   var rows = new Array(snapshot.itemCount + 1);
   rows[0] = headers.join(delim);
@@ -2769,6 +2966,8 @@ function setArraySnapshot(snapshot) {
 var binaryChannelNames = [];
 var binaryChannelSignature = null;
 var binaryTimeOrigin = null;
+var superwatchWriteEvents = [];
+var superwatchLastWriteEvent = 0;
 var binaryLastTimestamp = null;
 var binaryLastSequence = null;
 var binaryLastDetailSequence = null;
@@ -2791,6 +2990,11 @@ var binaryRateLastTimestampNs = null;
 var binaryRateSampleIntervals = 0;
 var frozenFullTimeRange = null;
 var frozenSharedYRange = null;
+var binaryFreezeRequester = null;
+
+function setBinaryFreezeRequester(requester) {
+  binaryFreezeRequester = typeof requester === 'function' ? requester : null;
+}
 
 function resetBinarySampleRate() {
   if (!IS_SUPERWATCH_MODE) return;
@@ -2825,6 +3029,7 @@ function updateBinarySampleRate(batch) {
 }
 
 function clearFrozenView() {
+  if (frozenFullTimeRange && binaryFreezeRequester) binaryFreezeRequester(false);
   frozenFullTimeRange = null;
   frozenSharedYRange = null;
 }
@@ -2844,6 +3049,7 @@ function freezeRenderedView() {
   if (!hasData) return false;
   frozenFullTimeRange = computeFullTimeRange();
   frozenSharedYRange = getSharedYRange();
+  if (binaryFreezeRequester) binaryFreezeRequester(true);
   return true;
 }
 
@@ -2853,7 +3059,6 @@ function discardPausedBinarySnapshot() {
     var field = FIELDS[binaryChannelNames[channel]];
     if (field && field.ringBuf) field.ringBuf.clear();
   }
-  resetTimelineView();
 }
 
 function configureBinaryChannels(channels) {
@@ -3190,6 +3395,19 @@ function renderBinaryEnvelope(envelope, renderWhilePaused) {
     return false;
   }
   canvas.dataset.binaryEnvelopeState = 'rendered';
+  // The worker can advance past the last UI summary before handling pause.
+  // Use the retained snapshot's bounds, then request its actual visible range.
+  if (IS_SUPERWATCH_MODE && paused && frozenFullTimeRange && binaryTimeOrigin !== null &&
+      Number.isFinite(envelope.frozenStartMs) && Number.isFinite(envelope.frozenEndMs) &&
+      envelope.frozenEndMs > envelope.frozenStartMs) {
+    var actualMin = envelope.frozenStartMs / 1000 - binaryTimeOrigin;
+    var actualMax = envelope.frozenEndMs / 1000 - binaryTimeOrigin;
+    if (frozenFullTimeRange.tMin !== actualMin || frozenFullTimeRange.tMax !== actualMax) {
+      frozenFullTimeRange = { tMin: actualMin, tMax: actualMax };
+      if (binaryVisibleRangeRequester) binaryVisibleRangeRequester();
+      return true;
+    }
+  }
   canvas.dataset.binaryEnvelopePoints = String(envelope.pointCount);
   binaryEnvelope = parsed;
   if (!paused || renderWhilePaused) {
@@ -3207,6 +3425,8 @@ function renderBinaryEnvelope(envelope, renderWhilePaused) {
 
 function resetBinaryStream() {
   if (!IS_BINARY_WAVEFORM_MODE) return;
+  superwatchWriteEvents = [];
+  superwatchLastWriteEvent = 0;
   singleTriggerCaptureFrozen = false;
   binaryTimeOrigin = null;
   binaryLastTimestamp = null;
@@ -3235,7 +3455,8 @@ function updateBinaryHealth(health) {
   var phase = String(health.phase || 'stopped');
   if (stateBadge) {
     stateBadge.textContent = 'transport ' + phase +
-      (health.reconnectDelayMs ? ' (' + health.reconnectDelayMs + ' ms)' : '');
+      (health.reconnectDelayMs ? ' (' + health.reconnectDelayMs + ' ms)' : '') +
+      (health.error ? ': ' + String(health.error) : '');
     stateBadge.className = 'badge ' + (
       phase === 'connected' ? 'badge-ok' :
       phase === 'error' ? 'badge-err' :
@@ -3280,14 +3501,17 @@ function disposeViewer() {
 if (typeof window !== 'undefined') {
   if (!window.__waveformViewers) window.__waveformViewers = {};
   var binaryViewer = window.__waveformViewers[CONFIG.mode] || {};
+  binaryViewer.setWorkspace = setWorkspace;
   binaryViewer.configureBinaryChannels = configureBinaryChannels;
   binaryViewer.acceptBinaryBatch = acceptBinaryBatch;
   binaryViewer.acceptBinarySummary = acceptBinarySummary;
   binaryViewer.getBinaryVisibleRange = getBinaryVisibleRange;
   binaryViewer.renderBinaryEnvelope = renderBinaryEnvelope;
   binaryViewer.setBinaryHistoryRequester = setBinaryHistoryRequester;
+  binaryViewer.setBinaryCapacityRequester = setBinaryCapacityRequester;
   binaryViewer.setBinaryDetailRequester = setBinaryDetailRequester;
   binaryViewer.setBinaryVisibleRangeRequester = setBinaryVisibleRangeRequester;
+  binaryViewer.setBinaryFreezeRequester = setBinaryFreezeRequester;
   binaryViewer.getStorageDiagnostics = getBinaryStorageDiagnostics;
   binaryViewer.exportBinaryHistorySnapshot = exportBinaryHistorySnapshot;
   binaryViewer.resetBinaryStream = resetBinaryStream;
@@ -3310,7 +3534,8 @@ function computeFullTimeRange() {
       Number.isFinite(binaryBufferStart) && Number.isFinite(binaryBufferEnd)) {
     var retainedMin = binaryBufferStart - binaryTimeOrigin;
     var retainedMax = binaryBufferEnd - binaryTimeOrigin;
-    if (!singleTriggerCaptureFrozen && retainedMax - retainedMin < 1) retainedMin = retainedMax - 1;
+    // Do not invent a one-second history when a high-rate buffer retains less.
+    if (retainedMax <= retainedMin) retainedMin = retainedMax - 0.000001;
     return { tMin: retainedMin, tMax: retainedMax };
   }
   var tMax = 0, tMin = Infinity;
@@ -3472,6 +3697,9 @@ function getSharedYRange(excludedName) {
 }
 
 function getSuperwatchPanelAtY(localY) {
+  if (chartPanelLayout && chartPanelLayout.panes) {
+    return chartPanelLayout.panes.find(function(p) { return localY >= p.top && localY <= p.top+p.height+12; }) || chartPanelLayout.panes[0];
+  }
   if (!IS_SUPERWATCH_MODE || !chartPanelLayout || !chartPanelLayout.split) {
     return { kind: 'main', top: chartPanelLayout ? chartPanelLayout.mainTop : 0, height: chartPanelLayout ? chartPanelLayout.mainHeight : 1 };
   }
@@ -3482,11 +3710,16 @@ function getSuperwatchPanelAtY(localY) {
 }
 
 function getPanelYRange(panel) {
+  if (panel && panel.kind === "workspace") return workspaceRange(panel);
   if (panel && panel.kind === 'split' && panel.name) return getChannelYRange(panel.name);
   return getSharedYRange(splitChannelName);
 }
 
 function setPanelYRange(panel, yMin, yMax) {
+  if (panel && panel.kind === 'workspace') {
+    if (!Number.isFinite(yMin) || !Number.isFinite(yMax) || yMax <= yMin) return false;
+    workspaceY[panel.id] = {yMin:yMin,yMax:yMax}; return true;
+  }
   if (panel && panel.kind === 'split' && panel.name) {
     var ys = ensureChannelYState(panel.name);
     yMin = Number(yMin);
@@ -3520,6 +3753,7 @@ function zoomPanelYAt(panel, anchorRatio, deltaY) {
 }
 
 function resetPanelY(panel) {
+  if (panel && panel.kind === 'workspace') { delete workspaceY[panel.id]; drawChart(); return; }
   if (panel && panel.kind === 'split' && panel.name) resetChannelY(panel.name);
   else globalYView = { zoom: 1, offset: 0, autoRange: true, manualMin: null, manualMax: null };
   drawChart();
@@ -3580,6 +3814,7 @@ function zoomTimelineAt(clientX, deltaY) {
   var full = getFullTimeRange();
   var fullRange = full.tMax - full.tMin;
   if (!(fullRange > 0)) return;
+  if (IS_SUPERWATCH_MODE) superwatchTimelineUserAdjusted = true;
   var current = getVisibleTimeRange();
   var rect = canvas.getBoundingClientRect();
   var pointerX = Number.isFinite(clientX) ? clientX : rect.left + rect.width / 2;
@@ -3770,6 +4005,28 @@ function formatTimeAxisValue(seconds) {
   return (seconds * 1000).toFixed(1) + 'ms';
 }
 
+// Stable 1/2/5 time divisions anchored to acquisition time, not viewport edges.
+function timeGrid(min, max, width) {
+  var span = max - min;
+  if (!isFinite(span) || span <= 0) return null;
+  var raw = span / Math.max(2, Math.min(10, Math.floor(width / 100)));
+  var magnitude = Math.pow(10, Math.floor(Math.log10(raw)));
+  var fraction = raw / magnitude;
+  var step = (fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10) * magnitude;
+  var scale = step < 0.001 ? 1000000 : step < 1 ? 1000 : 1;
+  var unit = scale === 1000000 ? 'μs' : scale === 1000 ? 'ms' : 's';
+  var decimals = Math.max(0, Math.min(6, -Math.floor(Math.log10(step * scale) + 1e-9)));
+  function label(value) {
+    return (Math.abs(value) < step * 1e-8 ? 0 : value * scale).toFixed(decimals);
+  }
+  var ticks = [], minor = step / 5;
+  var first = Math.ceil(min / minor - 1e-8);
+  for (var index = first; index * minor <= max + minor * 1e-8 && ticks.length < 100; index++) {
+    ticks.push({ time: index * minor, major: index % 5 === 0 });
+  }
+  return { step: step, unit: unit, label: label, division: label(step) + ' ' + unit + '/div', ticks: ticks };
+}
+
 function formatYAxisValue(value, span) {
   var absValue = Math.abs(value);
   var absSpan = Math.abs(span);
@@ -3790,12 +4047,20 @@ function formatYAxisValue(value, span) {
 // Canvas chart drawing (enhanced with per-channel Y, timeline, cursors)
 // ============================================================
 function drawChart() {
+  var activePanes=activeWorkspacePanes();
+  var workspaceWrap=document.getElementById('chart-wrap');
+  if (activePanes && workspaceWrap) {
+    var desiredHeight=Math.max(240,activePanes.length*130)+'px';
+    if (workspaceWrap.style.minHeight!==desiredHeight) workspaceWrap.style.minHeight=desiredHeight;
+  }
   if (!resize()) return;
   resizeMinimap();
   var W = canvas.clientWidth || parseFloat(canvas.style.width);
   var H = canvas.clientHeight || parseFloat(canvas.style.height);
   if (!Number.isFinite(W) || !Number.isFinite(H) || W <= 0 || H <= 0) return;
   ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = CHART_BG;
+  ctx.fillRect(0, 0, W, H);
 
   // Get visible time range (with zoom/offset)
   var tr = getVisibleTimeRange();
@@ -3822,7 +4087,7 @@ function drawChart() {
   var ph = H - mt - mb;
   if (pw <= 0 || ph <= 0) return;
 
-  var splitActive = IS_SUPERWATCH_MODE && splitChannelName &&
+  var splitActive = !watchWorkspace && IS_SUPERWATCH_MODE && splitChannelName &&
     FIELDS[splitChannelName] && FIELDS[splitChannelName].visible &&
     visChNames.length >= 2;
   if (IS_SUPERWATCH_MODE && splitChannelName && !splitActive) {
@@ -3844,6 +4109,22 @@ function drawChart() {
     width: pw
   };
   updateSplitPanelControl(splitActive, splitActive ? mainTop + mainHeight + panelGap / 2 : null);
+  var workspacePanels = null;
+  if (IS_SUPERWATCH_MODE && watchWorkspace) {
+    var totalWeight=activePanes.reduce(function(sum,p){return sum+p.height;},0);
+    var availableHeight=Math.max(1,ph-(activePanes.length-1)*24);
+    var top=mt;
+    workspacePanels=activePanes.map(function(p){
+      var height=availableHeight*p.height/totalWeight;
+      var panel={kind:'workspace',id:p.id,name:p.name,top:top,height:height};
+      top+=height+24; return panel;
+    });
+    chartPanelLayout.panes=workspacePanels;
+    workspacePanels.forEach(function(p){p.range=workspaceRange(p);});
+    syncWorkspaceDividers(workspacePanels);
+    mainTop=workspacePanels[0].top; mainHeight=workspacePanels[0].height;
+  }
+
 
   // Global Y range (shared in SuperWatch main panel, legacy per-channel in VOFA)
   var yMin = Infinity, yMax = -Infinity;
@@ -3851,7 +4132,7 @@ function drawChart() {
   var mainYRange = null;
   var splitYRange = null;
   if (IS_SUPERWATCH_MODE) {
-    mainYRange = getSharedYRange(splitActive ? splitChannelName : null);
+    mainYRange = workspacePanels ? workspacePanels[0].range : getSharedYRange(splitActive ? splitChannelName : null);
     if (!mainYRange) return;
     yMin = mainYRange.yMin;
     yMax = mainYRange.yMax;
@@ -3885,6 +4166,10 @@ function drawChart() {
   // Per-channel Y: each channel normalized to its own min/max by default
   // (avoids small signals being crushed when channels have very different ranges)
   function tyForChannel(v, name) {
+    if (workspacePanels) {
+      var panel=panelForSignal(name), range=panel.range;
+      return panel.top+panel.height-(v-range.yMin)/(range.yMax-range.yMin || 1)*panel.height;
+    }
     if (IS_SUPERWATCH_MODE) {
       if (splitActive && name === splitChannelName && splitYRange) {
         return splitTop + splitHeight - (v - splitYRange.yMin) /
@@ -3916,31 +4201,43 @@ function drawChart() {
       }
     }
   }
-  drawPanelGrid(mainTop, mainHeight, IS_SUPERWATCH_MODE ? mainYRange : { yMin: yMin, yMax: yMax });
+  if (workspacePanels) workspacePanels.forEach(function(panel) {
+    drawPanelGrid(panel.top,panel.height,panel.range);
+    ctx.fillStyle=TEXT_DIM; ctx.textAlign='left';ctx.font='bold 11px sans-serif';
+    ctx.fillText(panel.name,ml+8,panel.top+12);
+  });
+  else drawPanelGrid(mainTop, mainHeight, IS_SUPERWATCH_MODE ? mainYRange : { yMin: yMin, yMax: yMax });
   if (splitActive) drawPanelGrid(splitTop, splitHeight, splitYRange);
 
-  // Time grid is shared, but each split panel gets its own vertical strokes.
-  for (var i = 0; i <= 5; i++) {
-    var xv = tMin + (tMax - tMin) * i / 5;
+  // Shared time divisions across all panels; minor ticks stay visually secondary.
+  var timingGrid = IS_SUPERWATCH_MODE && !arrayOnly ? timeGrid(tMin, tMax, pw) : null;
+  var timeTicks = timingGrid ? timingGrid.ticks : [0,1,2,3,4,5].map(function(i) {
+    return {time:tMin+(tMax-tMin)*i/5,major:true,index:i};
+  });
+  for (var i = 0; i < timeTicks.length; i++) {
+    var tick = timeTicks[i], xv = tick.time;
     var xp = Math.round(tx(xv)) + 0.5;
+    ctx.globalAlpha = tick.major ? 1 : 0.35;
+    ctx.lineWidth = tick.major ? 0.8 : 0.5;
     ctx.beginPath();
-    ctx.moveTo(xp, mainTop); ctx.lineTo(xp, mainTop + mainHeight);
-    if (splitActive) {
-      ctx.moveTo(xp, splitTop); ctx.lineTo(xp, splitTop + splitHeight);
-    }
+    if (workspacePanels) workspacePanels.forEach(function(panel){ctx.moveTo(xp,panel.top);ctx.lineTo(xp,panel.top+panel.height);});
+    else {ctx.moveTo(xp, mainTop);ctx.lineTo(xp, mainTop+mainHeight);}
+    if (splitActive) {ctx.moveTo(xp,splitTop);ctx.lineTo(xp,splitTop+splitHeight);}
     ctx.stroke();
+    ctx.globalAlpha = 1;
+    if (!tick.major) continue;
     ctx.fillStyle = TEXT_DIM;
     ctx.font = '11px ' + getComputedStyle(document.body).getPropertyValue('--font-mono');
-    ctx.textAlign = 'center';
+    ctx.textAlign = xp < ml+35 ? 'left' : xp > ml+pw-35 ? 'right' : 'center';
     ctx.fillText(arrayOnly
-      ? String(arrayOnly.arrayStartIndex + Math.round((arrayOnly.arrayValues.length - 1) * i / 5))
-      : formatTimeAxisValue(xv), xp, mt + ph + 16);
+      ? String(arrayOnly.arrayStartIndex + Math.round((arrayOnly.arrayValues.length-1)*tick.index/5))
+      : timingGrid ? timingGrid.label(xv)+' '+timingGrid.unit : formatTimeAxisValue(xv),xp,mt+ph+16);
   }
-
   ctx.fillStyle = TEXT_DIM;
   ctx.font = '11px ' + getComputedStyle(document.body).getPropertyValue('--font-body');
   ctx.textAlign = 'center';
-  ctx.fillText(arrayOnly ? 'index' : 'time (' + timeUnit + ')', ml + pw/2, H - 4);
+  ctx.fillText(arrayOnly ? 'index' : timingGrid ? 'time ('+timingGrid.unit+') · '+timingGrid.division : 'time ('+timeUnit+')',ml+pw/2,H-4);
+
   ctx.save();
   ctx.translate(10, mainTop + mainHeight/2);
   ctx.rotate(-Math.PI/2);
@@ -3956,7 +4253,7 @@ function drawChart() {
     ctx.fillRect(ml, mainTop + mainHeight + Math.floor(panelGap / 2), pw, 1);
   }
 
-  var names = sortedFieldNames();
+  var names = sortedFieldNames().slice().sort(function(a,b){return Number(!!signalStyle(a).emphasis)-Number(!!signalStyle(b).emphasis);});
   for (var ni = 0; ni < names.length; ni++) {
     var name = names[ni];
     var meta = FIELDS[name];
@@ -3964,15 +4261,18 @@ function drawChart() {
     if (!meta.visible || (!meta.isArraySnapshot && meta.ringBuf.count < 1 && !envelopeChannelRange) ||
         (meta.isArraySnapshot && (!meta.arrayValues || meta.arrayValues.length < 2))) continue;
 
-    var curveTop = splitActive && name === splitChannelName ? splitTop : mainTop;
-    var curveHeight = splitActive && name === splitChannelName ? splitHeight : mainHeight;
+    var curveTop = workspacePanels ? panelForSignal(name).top : splitActive && name === splitChannelName ? splitTop : mainTop;
+    var curveHeight = workspacePanels ? panelForSignal(name).height : splitActive && name === splitChannelName ? splitHeight : mainHeight;
     ctx.save();
     ctx.beginPath();
     ctx.rect(ml, curveTop, pw, curveHeight);
     ctx.clip();
 
     ctx.strokeStyle = meta.color;
-    ctx.lineWidth = 1.5;
+    var pointsOnly = signalStyle(name).renderMode === 'points';
+    var pointSize = signalStyle(name).emphasis ? 5 : 3;
+    ctx.fillStyle = meta.color;
+    ctx.lineWidth = signalStyle(name).emphasis ? 3 : 1.5;
     ctx.beginPath();
     var started = false;
     var ring = meta.ringBuf;
@@ -3981,10 +4281,11 @@ function drawChart() {
       for (var arrayIndex = 0; arrayIndex < arrayValues.length; arrayIndex++) {
         var arrayX = ml + (arrayIndex / Math.max(1, arrayValues.length - 1)) * pw;
         var arrayY = tyForChannel(arrayValues[arrayIndex], name);
-        if (arrayIndex === 0) { ctx.moveTo(arrayX, arrayY); started = true; }
+        if (pointsOnly) ctx.fillRect(arrayX-pointSize/2,arrayY-pointSize/2,pointSize,pointSize);
+        else if (arrayIndex === 0) { ctx.moveTo(arrayX, arrayY); started = true; }
         else ctx.lineTo(arrayX, arrayY);
       }
-      ctx.stroke();
+      if (!pointsOnly) ctx.stroke();
       ctx.restore();
       continue;
     }
@@ -3998,7 +4299,8 @@ function drawChart() {
         var envelopeX = tx(envelopeTime);
         var envelopeY = tyForChannel(binaryEnvelope.values[envelopePoint], name);
         if (envelopeX < ml - 10 || envelopeX > ml + pw + 10) continue;
-        if (!started) { ctx.moveTo(envelopeX, envelopeY); started = true; }
+        if (pointsOnly) ctx.fillRect(envelopeX-pointSize/2,envelopeY-pointSize/2,pointSize,pointSize);
+        else if (!started) { ctx.moveTo(envelopeX, envelopeY); started = true; }
         else ctx.lineTo(envelopeX, envelopeY);
       }
     } else {
@@ -4013,11 +4315,12 @@ function drawChart() {
       for (var i = ringStart; i < ringEnd; i += ringStep) {
         var sx = tx(ring.timeAt(i)), sy = tyForChannel(ring.valueAt(i), name);
         if (sx < ml - 10 || sx > ml + pw + 10) continue;
-        if (!started) { ctx.moveTo(sx, sy); started = true; }
+        if (pointsOnly) ctx.fillRect(sx-pointSize/2,sy-pointSize/2,pointSize,pointSize);
+        else if (!started) { ctx.moveTo(sx, sy); started = true; }
         else ctx.lineTo(sx, sy);
       }
     }
-    ctx.stroke();
+    if (!pointsOnly) ctx.stroke();
     ctx.restore();
   }
 
@@ -4045,7 +4348,7 @@ function drawChart() {
     var probeX = hoverProbe.mx;
     if (probeX >= ml && probeX <= ml + pw) {
       ctx.save();
-      ctx.strokeStyle = 'rgba(20,20,19,0.35)';
+      ctx.strokeStyle = CROSSHAIR_COLOR;
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 3]);
       ctx.beginPath();
@@ -4063,8 +4366,8 @@ function drawChart() {
       ? { kind: 'split', name: splitChannelName }
       : { kind: 'main' };
     var trigY = tyForChannel(triggerSettings.level, triggerSettings.source);
-    var triggerTop = triggerPanel.kind === 'split' ? splitTop : mainTop;
-    var triggerBottom = triggerPanel.kind === 'split' ? splitTop + splitHeight : mainTop + mainHeight;
+    var triggerTop = workspacePanels ? panelForSignal(triggerSettings.source).top : triggerPanel.kind === 'split' ? splitTop : mainTop;
+    var triggerBottom = workspacePanels ? triggerTop+panelForSignal(triggerSettings.source).height : triggerPanel.kind === 'split' ? splitTop + splitHeight : mainTop + mainHeight;
     if (trigY >= triggerTop && trigY <= triggerBottom) {
       ctx.save();
       ctx.strokeStyle = '#b53333';
@@ -4091,6 +4394,24 @@ function drawChart() {
 
       ctx.restore();
     }
+  }
+
+  // Actual probe-side write timestamps share the sample clock.
+  if (IS_SUPERWATCH_MODE && binaryTimeOrigin !== null) {
+    ctx.save();
+    ctx.strokeStyle = '#e5a128'; ctx.fillStyle = '#e5a128';
+    ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+    superwatchWriteEvents.forEach(function(event, index) {
+      if (event.time_ms === null || !Number.isFinite(event.time_ms)) return;
+      var x = tx(event.time_ms / 1000 - binaryTimeOrigin);
+      if (x < ml || x > ml + pw) return;
+      ctx.setLineDash([3, 3]); ctx.beginPath();
+      ctx.moveTo(x, mt); ctx.lineTo(x, mt + ph); ctx.stroke();
+      ctx.setLineDash([]);
+      var label = signalLabel(event.path) + ' = ' + String(event.value);
+      ctx.fillText(label, Math.min(x + 4, ml + pw - ctx.measureText(label).width), mt + 14 + (index % 3) * 14);
+    });
+    ctx.restore();
   }
 
   // Measurement cursors A/B (Task 5I)
@@ -4185,7 +4506,7 @@ function drawChart() {
         lines.push(
           '<span class="tooltip-row">' +
           '<span class="tooltip-swatch" style="background:' + FIELDS[k].color + '"></span>' +
-          '<span>' + escapeHtml(k) + ': ' + escapeHtml(tipVal) + '</span>' +
+          '<span>' + escapeHtml(signalLabel(k)) + ': ' + escapeHtml(tipVal) + '</span>' +
           '</span>'
         );
       }
@@ -4319,11 +4640,11 @@ function drawChart() {
         ? { kind: 'split', name: splitChannelName }
         : { kind: 'main' };
       var trigY = tyForChannel(triggerSettings.level, triggerSettings.source);
-      var triggerTop = triggerPanel.kind === 'split' ? splitTop : mainTop;
-      var triggerBottom = triggerPanel.kind === 'split' ? splitTop + splitHeight : mainTop + mainHeight;
+      var triggerTop = workspacePanels ? panelForSignal(triggerSettings.source).top : triggerPanel.kind === 'split' ? splitTop : mainTop;
+      var triggerBottom = workspacePanels ? triggerTop+panelForSignal(triggerSettings.source).height : triggerPanel.kind === 'split' ? splitTop + splitHeight : mainTop + mainHeight;
       if (Math.abs(my - trigY) < 8 && my >= triggerTop && my <= triggerBottom) {
         draggingTrigger = true;
-        draggingTriggerPanel = triggerPanel;
+        draggingTriggerPanel = workspacePanels ? panelForSignal(triggerSettings.source) : triggerPanel;
         e.preventDefault();
         return;
       }
@@ -4410,8 +4731,8 @@ function drawChart() {
         var my = e.clientY - rect.top;
         var triggerTarget = draggingTriggerPanel || { kind: 'main' };
         var triggerRange = getPanelYRange(triggerTarget) || { yMin: yMin, yMax: yMax };
-        var triggerTop = triggerTarget.kind === 'split' ? splitTop : mainTop;
-        var triggerHeight = triggerTarget.kind === 'split' ? splitHeight : mainHeight;
+        var triggerTop = triggerTarget.kind === 'workspace' ? triggerTarget.top : triggerTarget.kind === 'split' ? splitTop : mainTop;
+        var triggerHeight = triggerTarget.kind === 'workspace' ? triggerTarget.height : triggerTarget.kind === 'split' ? splitHeight : mainHeight;
         var newLevel = triggerRange.yMin +
           (1 - (my - triggerTop) / Math.max(1, triggerHeight)) *
           (triggerRange.yMax - triggerRange.yMin);
@@ -4540,7 +4861,7 @@ function updateCursorReadout() {
       lines.push('+' + (names.length - i) + ' ch');
       break;
     }
-    lines.push(name + ' d=' + (bv - av).toFixed(meta.precision || 2));
+    lines.push(signalLabel(name) + ' d=' + (bv - av).toFixed(meta.precision || 2));
     deltaCount++;
   }
   cursorReadout.textContent = lines.join('  ');
@@ -4563,7 +4884,7 @@ function updateCursorReadout() {
         if (vc >= deltaLimit) break;
         var prec = vm.precision || 2;
         html += '<div class="cm-row">';
-        html += '<span class="cm-label" style="color:' + vm.color + '">' + escapeHtml(vn) + '</span>';
+        html += '<span class="cm-label" style="color:' + vm.color + '">' + escapeHtml(signalLabel(vn)) + '</span>';
         html += '<span class="cm-value">A:' + va.toFixed(prec) + ' B:' + vb.toFixed(prec) + ' dV:' + (vb - va).toFixed(prec) + '</span>';
         html += '</div>';
         vc++;
@@ -4583,7 +4904,7 @@ function updateCursorReadout() {
         if (ta === null || tb === null) continue;
         if (tc >= deltaLimit) break;
         html += '<div class="cm-row">';
-        html += '<span class="cm-label" style="color:' + tm.color + '">' + escapeHtml(tn) + '</span>';
+        html += '<span class="cm-label" style="color:' + tm.color + '">' + escapeHtml(signalLabel(tn)) + '</span>';
         html += '<span class="cm-value">d=' + (tb - ta).toFixed(tm.precision || 2) + '</span>';
         html += '</div>';
         tc++;
@@ -4658,6 +4979,8 @@ function drawMinimap() {
     var meta = FIELDS[names[ni]];
     if (!meta.visible || (!meta.isArraySnapshot && meta.ringBuf.count < 2) ||
         (meta.isArraySnapshot && (!meta.arrayValues || meta.arrayValues.length < 2))) continue;
+    var pointsOnly = signalStyle(names[ni]).renderMode === 'points';
+    minimapCtx.fillStyle = meta.color;
     minimapCtx.strokeStyle = meta.color;
     minimapCtx.lineWidth = 1;
     minimapCtx.beginPath();
@@ -4670,10 +4993,11 @@ function drawMinimap() {
       for (var arrayPoint = 0; arrayPoint < meta.arrayValues.length; arrayPoint++) {
         var arrayPx = arrayPoint / Math.max(1, meta.arrayValues.length - 1) * W;
         var arrayPy = H - ((meta.arrayValues[arrayPoint] - bufMin) / yRange) * (H - 4) - 2;
-        if (!started) { minimapCtx.moveTo(arrayPx, arrayPy); started = true; }
+        if (pointsOnly) minimapCtx.fillRect(arrayPx-1,arrayPy-1,2,2);
+        else if (!started) { minimapCtx.moveTo(arrayPx, arrayPy); started = true; }
         else minimapCtx.lineTo(arrayPx, arrayPy);
       }
-      minimapCtx.stroke();
+      if (!pointsOnly) minimapCtx.stroke();
       continue;
     }
     var minimapChannel = binaryChannelIndex[names[ni]];
@@ -4685,7 +5009,8 @@ function drawMinimap() {
         var minimapTime = binaryEnvelope.times[minimapTimeIndex] / 1000 - binaryTimeOrigin;
         var envelopePx = mtx(minimapTime);
         var envelopePy = H - ((binaryEnvelope.values[minimapPoint] - bufMin) / yRange) * (H - 4) - 2;
-        if (!started) { minimapCtx.moveTo(envelopePx, envelopePy); started = true; }
+        if (pointsOnly) minimapCtx.fillRect(envelopePx-1,envelopePy-1,2,2);
+        else if (!started) { minimapCtx.moveTo(envelopePx, envelopePy); started = true; }
         else minimapCtx.lineTo(envelopePx, envelopePy);
       }
     } else {
@@ -4694,11 +5019,12 @@ function drawMinimap() {
       for (var i = 0; i < ring.count; i += step) {
         var px = mtx(ring.timeAt(i));
         var py = H - ((ring.valueAt(i) - bufMin) / yRange) * (H - 4) - 2;
-        if (!started) { minimapCtx.moveTo(px, py); started = true; }
+        if (pointsOnly) minimapCtx.fillRect(px-1,py-1,2,2);
+        else if (!started) { minimapCtx.moveTo(px, py); started = true; }
         else minimapCtx.lineTo(px, py);
       }
     }
-    minimapCtx.stroke();
+    if (!pointsOnly) minimapCtx.stroke();
   }
   minimapCtx.globalAlpha = 1;
 
@@ -4822,7 +5148,6 @@ function showInspectorTree(tree) {
 function superwatchAddName(name) {
   name = String(name || '').trim();
   if (!name) return;
-  console.log('[superwatchAdd] name=' + name + ' alreadyInFields=' + !!FIELDS[name]);
   fetch(API_SW + 'add', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -4830,7 +5155,6 @@ function superwatchAddName(name) {
   })
     .then(function(r){ return r.json(); })
     .then(function(d){
-      console.log('[superwatchAdd] response for ' + name + ':', JSON.stringify(d.item));
       if (d.item && d.item.name) {
         delete _removedChannels[d.item.name];
         var meta = {};
@@ -5209,9 +5533,13 @@ function appendTriggerPoint(point) {
   });
 
   document.getElementById('trigger-pretrig').addEventListener('input', function() {
-    triggerSettings.preTriggerSamples = parseInt(this.value) || 1000;
+    if (validPreTriggerSamples(this.valueAsNumber)) triggerSettings.preTriggerSamples = this.valueAsNumber;
   });
 })();
+
+function validPreTriggerSamples(value) {
+  return Number.isInteger(value) && value >= 10 && value <= 50000;
+}
 
 // ============================================================
 // Cursor toggle (Task 5I)

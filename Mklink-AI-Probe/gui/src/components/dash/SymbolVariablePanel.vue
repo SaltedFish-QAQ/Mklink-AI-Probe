@@ -1,11 +1,12 @@
 <template>
   <aside class="symbol-panel">
+    <SelectedSignals :paths="[...selected]" :values="latestValues" :hidden="hiddenChannels" @visibility="(path, visible) => emit('visibility-change', path, visible)" />
     <div class="panel-toolbar">
       <input
         v-model="query"
         class="form-input"
         data-testid="variable-search"
-        :placeholder="tr('搜索变量，多个关键词用逗号分隔', 'Search variables; separate keywords with commas')"
+        :placeholder="tr('搜索：空格同时匹配，逗号任一匹配', 'Search: spaces AND, commas OR')"
       />
       <button
         class="icon-button"
@@ -66,6 +67,12 @@
         {{ tr('仅已选', 'Selected Only') }}
       </label>
       <span>{{ tr(`已选 ${selected.size}`, `${selected.size} selected`) }}</span>
+      <span class="path-alignment" :aria-label="tr('变量名称对齐', 'Variable name alignment')">
+        <button type="button" class="edit-button" data-testid="align-paths-left" @click="alignPaths('left')"
+          :title="tr('一键查看所有变量名称开头', 'Show the beginning of all variable names')">{{ tr('左对齐', 'Align left') }}</button>
+        <button type="button" class="edit-button" data-testid="align-paths-right" @click="alignPaths('right')"
+          :title="tr('一键查看所有变量名称末尾', 'Show the end of all variable names')">{{ tr('右对齐', 'Align right') }}</button>
+      </span>
       <button type="button" class="edit-button" data-testid="pin-selected"
         :disabled="pinsBusy || !pinsReady || selected.size === 0" @click="pinSelected">
         {{ tr('置顶已选', 'Pin selected') }}
@@ -74,7 +81,7 @@
     <div v-if="pinsError" class="stale-banner" role="alert">{{ pinsError }}</div>
 
     <div v-if="catalog.stale.value" class="stale-banner">{{ tr('AXF 已变化，请重新解析', 'AXF changed. Reparse symbols.') }}</div>
-    <div v-else-if="sourceReloaded" class="stale-banner">{{ tr('符号已重载，采集已停止。确认目标已下载对应固件后再启动。', 'Symbols reloaded and acquisition stopped. Confirm matching firmware on the target before restarting.') }}</div>
+    <div v-else-if="sourceReloaded" class="stale-banner">{{ tr('符号已重载；请确认目标上的固件与当前符号文件一致。', 'Symbols reloaded. Confirm that the target firmware matches the current symbol file.') }}</div>
     <SetupHint
       v-if="!deviceConnected"
       kind="device"
@@ -136,7 +143,7 @@
             <LoaderCircle v-if="catalog.browseLoading.value.has(row.node.key)" class="branch-spinner" :size="15" aria-hidden="true" />
             <ChevronDown v-else-if="row.expanded" :size="15" aria-hidden="true" />
             <ChevronRight v-else :size="15" aria-hidden="true" />
-            <span class="branch-name">{{ row.node.label }}</span>
+            <VariablePath class="branch-name" :path="row.node.label" :alignment="pathAlignment" />
             <span v-if="row.node.childCount !== null" class="branch-count">
               {{ row.node.kind === 'range' ? row.node.childCount : `${row.selectedLeafCount} / ${row.node.childCount}` }}
             </span>
@@ -180,7 +187,7 @@
           @click="openCLayout(row.node.container.path)"
         >
           <Code2 :size="15" aria-hidden="true" />
-          <span class="branch-name">{{ row.node.label }}</span>
+          <VariablePath class="branch-name" :path="row.node.label" :alignment="pathAlignment" />
           <span class="container-type">{{ row.node.container.type_name }}</span>
           <span class="container-state">{{ tr('待定义', 'Needs definition') }}</span>
         </button>
@@ -214,16 +221,9 @@
                 <Eye v-else :size="15" aria-hidden="true" />
               </button>
             </span>
-            <button
-              class="variable-name"
-              type="button"
-              :title="row.node.descriptor.path"
-              @click="beginEdit(row.node.descriptor)"
-            >
-              {{ row.node.label }}
-            </button>
+            <VariablePath class="variable-name" :path="displayPrefs.style(row.node.descriptor.path).alias || row.node.descriptor.path" :alignment="pathAlignment" />
             <span class="variable-type">{{ row.node.descriptor.type_name }}</span>
-            <span :data-testid="`latest-${row.node.descriptor.path}`" class="variable-value">
+            <span :data-testid="`latest-${row.node.descriptor.path}`" class="variable-value" :title="formatValue(latestValues[row.node.descriptor.path])">
               {{ formatValue(latestValues[row.node.descriptor.path]) }}
             </span>
             <button
@@ -398,6 +398,9 @@ import type { SymbolDescriptor } from '../../types/mklink'
 import type { SymbolTreeNode, VisibleSymbolRow } from '../../lib/symbolTree'
 import { tr } from '../../composables/useLanguage'
 import SetupHint from './SetupHint.vue'
+import VariablePath from './VariablePath.vue'
+import SelectedSignals from './SelectedSignals.vue'
+import { useWatchWorkspace } from '../../composables/useWatchWorkspace'
 import { API_BASE } from '../../lib/runtimeEndpoint'
 
 const props = withDefaults(defineProps<{
@@ -420,6 +423,7 @@ const emit = defineEmits<{
 }>()
 
 const catalog = useSymbolCatalog()
+const displayPrefs = useWatchWorkspace()
 const toast = useToast()
 const {
   connecting,
@@ -430,6 +434,10 @@ const {
   parseSelectedSymbols,
 } = useDashboardSetup()
 const query = ref('')
+const pathAlignment = ref<{ edge: 'left' | 'right'; revision: number }>({ edge: 'left', revision: 0 })
+function alignPaths(edge: 'left' | 'right'): void {
+  pathAlignment.value = { edge, revision: pathAlignment.value.revision + 1 }
+}
 const sourceReloaded = ref(false)
 const manualAddOpen = ref(false)
 const manualPath = ref('')
@@ -465,12 +473,16 @@ const snapshotCount = ref('128')
 let searchExpansionSnapshot: Set<string> | null = null
 let searchRequest = 0
 
+const browseNodes = computed(() => [
+  ...catalog.browseRoots.value,
+  ...[...catalog.browseChildren.value.values()].flat(),
+])
 const tree = computed(() => {
   if (query.value.trim()) {
-    return buildSymbolTree(searchItems.value, catalog.containers.value)
+    return buildSymbolTree(searchItems.value, catalog.containers.value, browseNodes.value)
   }
   if (selectedOnly.value) {
-    return buildSymbolTree([...selectedDescriptors.value.values()])
+    return buildSymbolTree([...selectedDescriptors.value.values()], [], browseNodes.value)
   }
   return buildBrowseTree(catalog.browseRoots.value, catalog.browseChildren.value)
 })
@@ -479,6 +491,7 @@ const rows = computed(() => visibleSymbolRows(tree.value, {
   collapsed: query.value.trim() || selectedOnly.value ? filteredCollapsed.value : undefined,
   selected: selected.value,
   query: query.value,
+  alias: path => displayPrefs.style(path).alias,
   selectedOnly: selectedOnly.value,
 }))
 const variableGroups = computed(() => [
@@ -835,6 +848,10 @@ async function writeValue(symbol: SymbolDescriptor): Promise<void> {
   try {
     const result = await catalog.writeSymbol(symbol.path, typedValue(symbol))
     writeSuccess[symbol.path] = result.value
+    if (result.mode === 'legacy-gap') {
+      toast.info(tr('已写入并校验。当前固件或目标地址使用兼容写入，期间有采样空档，曲线历史已保留。',
+        'Written and verified. Compatibility writes for this firmware or target address have a sampling gap; curve history is preserved.'))
+    }
     editing.value = null
   } catch (cause) {
     toast.error(cause instanceof Error ? cause.message : String(cause))
@@ -872,6 +889,15 @@ async function refreshSourceStatus(): Promise<void> {
     const previousGeneration = catalog.generation.value
     await catalog.refreshStatus()
     if (disposed) return
+    const watchList = await request('/api/dash/superwatch/items')
+    if (disposed) return
+    if (Array.isArray(watchList.items)) {
+      const next = new Set<string>(watchList.items.map((item: { name: string }) => item.name))
+      if (next.size !== selected.value.size || [...next].some(path => !selected.value.has(path))) {
+        selected.value = next
+        await refreshSelectedDescriptors()
+      }
+    }
     if (catalog.generation.value !== previousGeneration) {
       sourceReloaded.value = true
       editing.value = null
@@ -954,7 +980,8 @@ watch(tree, roots => {
 .icon-button:disabled { color: var(--muted); cursor: default; }
 .manual-add-row { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 .manual-add-row .form-input { min-width: 0; flex: 1; }
-.panel-filters { display: flex; justify-content: space-between; padding: 7px 10px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--border); }
+.panel-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: space-between; padding: 7px 10px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--border); }
+.path-alignment { display: flex; gap: 4px; }
 .panel-filters label { display: flex; align-items: center; gap: 5px; }
 .stale-banner { padding: 7px 10px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); font-size: 12px; }
 .variable-groups { display: flex; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; }
@@ -1037,7 +1064,7 @@ watch(tree, roots => {
 .container-row:hover { background: color-mix(in srgb, var(--accent) 5%, var(--surface)); }
 .container-type { overflow: hidden; color: var(--muted); font: 11px Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .container-state { color: var(--warn); font-size: 11px; white-space: nowrap; }
-.branch-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px Consolas, monospace; }
+.branch-name { min-width: 0; white-space: nowrap; font: 12px Consolas, monospace; }
 .branch-count { color: var(--muted); font: 11px Consolas, monospace; }
 .variable-row { border-bottom: 1px solid var(--border); }
 .variable-row.selected { background: color-mix(in srgb, var(--accent) 7%, transparent); }
@@ -1047,10 +1074,10 @@ watch(tree, roots => {
 .visibility-button:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .visibility-button.hidden { color: var(--muted); }
 .visibility-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.variable-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; background: transparent; color: var(--fg); cursor: pointer; text-align: left; font: 12px Consolas, monospace; }
+.variable-name { min-width: 0; }
 .variable-type, .variable-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font: 11px Consolas, monospace; }
-.variable-value { color: var(--info); text-align: right; }
-@container (max-width: 440px) {
+.variable-value { color: var(--info); text-align: right; white-space: normal; overflow-wrap: anywhere; }
+@container (max-width: 720px) {
   .variable-main { grid-template-columns: 18px 24px minmax(0, 1fr) 32px auto; row-gap: 0; }
   .variable-main > input { grid-column: 1; grid-row: 1 / 3; }
   .visibility-slot { grid-column: 2; grid-row: 1 / 3; }

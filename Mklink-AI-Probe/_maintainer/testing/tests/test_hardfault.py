@@ -1,5 +1,6 @@
 import struct
 from types import SimpleNamespace
+import pytest
 
 from mklink import mcp_server
 from mklink.device import Device
@@ -11,6 +12,35 @@ from mklink.hardfault import (
     format_hardfault_report,
     parse_exception_stack_frame,
 )
+
+
+def test_fault_detection_does_not_depend_on_selected_svd():
+    reads = []
+    device = SimpleNamespace(
+        _require_connected=lambda: None, mcu_name="STM32F103RE",
+        read_register=lambda name: (_ for _ in ()).throw(KeyError(name)),
+        read_memory=lambda address, size: (
+            reads.append((address, size)) or struct.pack("<II", 1 << 16, 1 << 30)
+        ),
+    )
+    assert Device.check_hardfault(device) == {
+        "SCB.CFSR": 1 << 16, "SCB.HFSR": 1 << 30,
+    }
+    assert reads == [(0xE000ED28, 8)]
+    device.read_memory = lambda *_: bytes(8)
+    assert Device.check_hardfault(device) is None
+
+
+def test_fault_read_failure_is_not_reported_as_no_fault():
+    device = SimpleNamespace(
+        _require_connected=lambda: None, mcu_name="STM32F103RE",
+        read_memory=lambda *_: (_ for _ in ()).throw(OSError("debug unavailable")),
+    )
+    with pytest.raises(OSError, match="debug unavailable"):
+        Device.check_hardfault(device)
+    device.mcu_name = "HPM5301"
+    with pytest.raises(ValueError, match="Cortex-M"):
+        Device.check_hardfault(device)
 
 
 def test_addr2line_uses_selected_elf_backend(monkeypatch):
@@ -118,7 +148,7 @@ def test_device_hardfault_reads_exception_psp_instead_of_dcrdr(monkeypatch):
     stack_data = struct.pack(f"<{len(words)}I", *words).ljust(512, b"\x00")
     reads = []
     device = Device(axf="firmware.axf")
-    device._bridge = object()
+    device._bridge = SimpleNamespace(current_mcu="STM32F103RE", idcode=0x1ba01477)
     device._connected = True
 
     monkeypatch.setattr(device, "halt", lambda: None)
@@ -209,3 +239,31 @@ def test_mcp_hardfault_exposes_fault_function_and_call_stack(monkeypatch):
         "mklink_hardfault_leaf", "mklink_hardfault_caller",
     ]
     assert result["core_registers"]["psp"] == 0x20001000
+
+@pytest.mark.parametrize('registers', [{}, {'SCB.CFSR': 0, 'SCB.HFSR': 0}, {'SCB.BFAR': 0x20000000}])
+def test_zero_fault_snapshot_never_halts_or_reads(registers):
+    from unittest.mock import Mock
+    device = Device()
+    device._connected = True
+    device._bridge = SimpleNamespace(current_mcu="STM32F103RE", idcode=0x1ba01477)
+    device.halt = Mock()
+    device.read_core_registers = Mock(return_value={})
+    device.read_memory = Mock()
+    assert device.decode_hardfault(registers) is None
+    device.halt.assert_not_called()
+    device.read_core_registers.assert_not_called()
+    device.read_memory.assert_not_called()
+
+
+@pytest.mark.parametrize('registers', [{}, {'SCB.CFSR': 0, 'SCB.HFSR': 0}, {'SCB.CFSR': 1 << 16}])
+def test_explicit_fault_snapshot_cannot_bypass_hpm_guard(registers):
+    from unittest.mock import Mock
+    device = Device()
+    device._connected = True
+    device._bridge = SimpleNamespace(current_mcu="Unknown", idcode=0x1000563D)
+    device.halt = Mock()
+    device.read_core_registers = Mock()
+    with pytest.raises(ValueError, match='Cortex-M'):
+        device.decode_hardfault(registers)
+    device.halt.assert_not_called()
+    device.read_core_registers.assert_not_called()

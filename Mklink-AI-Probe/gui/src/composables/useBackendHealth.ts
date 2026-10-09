@@ -9,35 +9,42 @@ import {
 
 /** 'starting' = backend not yet checked / currently booting */
 const backendState = ref<'starting' | 'alive' | 'dead'>('starting')
+export const sharedRuntime = ref(false)
+const authenticationRequired = ref(false)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let refCount = 0
 let firstCheckDone = false
+let restarting = false
 
 async function checkBackendHealth(): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(3000) })
+    authenticationRequired.value = res.status === 401
     if (!res.ok) return false
     const payload = await res.json().catch(() => null)
     if (payload && typeof payload === 'object') {
       applyReportedBackendPort((payload as { backend_port?: unknown }).backend_port)
+      sharedRuntime.value = (payload as { shared_runtime?: unknown }).shared_runtime === true
     }
     return true
   } catch {
+    authenticationRequired.value = false
     return false
   }
 }
 
 async function refreshHealth() {
+  if (restarting) return
   const alive = IS_TAURI
     ? await checkViaTauri()
     : await checkBackendHealth()
 
+  if (restarting) return
   if (alive) {
     backendState.value = 'alive'
     firstCheckDone = true
-  } else if (firstCheckDone) {
-    // Only show 'dead' after at least one successful check
-    // This prevents flashing red during initial startup
+  } else if (firstCheckDone || authenticationRequired.value) {
+    // Network startup failures get a grace period; a 401 needs action immediately.
     backendState.value = 'dead'
   }
   // If !firstCheckDone && !alive, keep 'starting'
@@ -46,7 +53,7 @@ async function refreshHealth() {
 async function checkViaTauri(): Promise<boolean> {
   try {
     const alive = await (window as any).__TAURI__.invoke('backend_alive')
-    return !!alive
+    return !!alive && await checkBackendHealth()
   } catch {
     return await checkBackendHealth()
   }
@@ -62,7 +69,7 @@ function startHealthPolling(intervalMs = 5000) {
   pollTimer = setInterval(async () => {
     fastPolls++
     await refreshHealth()
-    if (fastPolls >= maxFastPolls && backendState.value === 'starting') {
+    if (!restarting && fastPolls >= maxFastPolls && backendState.value === 'starting') {
       backendState.value = 'dead'
       firstCheckDone = true
     }
@@ -82,27 +89,33 @@ function stopHealthPolling() {
 }
 
 async function restart(): Promise<void> {
-  backendState.value = 'starting'
-  firstCheckDone = false
-  if (IS_TAURI) {
-    try {
-      await restartRuntimeBackend()
-    } catch (e) {
-      console.error('[useBackendHealth] restart failed:', e)
+  if (restarting) return
+  restarting = true
+  try {
+    backendState.value = 'starting'
+    firstCheckDone = false
+    if (IS_TAURI) {
+      try {
+        await restartRuntimeBackend()
+      } catch (e) {
+        console.error('[useBackendHealth] restart failed:', e)
+      }
     }
-  }
-  // Wait for backend to come back up (up to 15s)
-  for (let i = 0; i < 30; i++) {
-    await new Promise(r => setTimeout(r, 500))
-    if (await checkBackendHealth()) {
-      backendState.value = 'alive'
+    // Endpoint publication can precede HTTP readiness by a short interval.
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 500))
+      if (await checkBackendHealth()) {
+        backendState.value = 'alive'
+        firstCheckDone = true
+        break
+      }
+    }
+    if (backendState.value === 'starting') {
+      backendState.value = 'dead'
       firstCheckDone = true
-      break
     }
-  }
-  if (backendState.value === 'starting') {
-    backendState.value = 'dead'
-    firstCheckDone = true
+  } finally {
+    restarting = false
   }
 }
 
@@ -118,6 +131,8 @@ export function useBackendHealth() {
 
   return {
     backendState,
+    sharedRuntime,
+    authenticationRequired,
     backendPort: runtimeBackendPort,
     isTauri: IS_TAURI,
     startHealthPolling,

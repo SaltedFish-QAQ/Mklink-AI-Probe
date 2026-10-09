@@ -1,3 +1,4 @@
+import { matchesSignal } from './signalSearch'
 import type { SymbolBrowseNode, SymbolContainerDescriptor, SymbolDescriptor } from '../types/mklink'
 
 export interface SymbolTreeNode {
@@ -25,6 +26,7 @@ export interface VisibleSymbolOptions {
   selected: ReadonlySet<string>
   query: string
   selectedOnly: boolean
+  alias?: (path: string) => string
 }
 
 interface MutableSymbolTreeNode extends SymbolTreeNode {
@@ -104,6 +106,7 @@ export function buildBrowseTree(
 export function buildSymbolTree(
   items: readonly SymbolDescriptor[],
   containers: readonly SymbolContainerDescriptor[] = [],
+  browseNodes: readonly SymbolBrowseNode[] = [],
 ): SymbolTreeNode[] {
   const roots: MutableSymbolTreeNode[] = []
   const rootIndex = new Map<string, MutableSymbolTreeNode>()
@@ -152,6 +155,18 @@ export function buildSymbolTree(
     })
   }
 
+  // Search descriptors describe leaves only. Retain authoritative container
+  // capabilities without adding unloaded or nonmatching children to results.
+  const browseByKey = new Map(browseNodes.map(node => [node.key, node]))
+  function attachBrowse(node: MutableSymbolTreeNode): void {
+    const browse = browseByKey.get(node.key)
+    if (browse && node.kind === 'branch' && browse.kind === 'branch') {
+      node.browse = browse
+      node.childCount = browse.child_count
+    }
+    node.children.forEach(attachBrowse)
+  }
+  roots.forEach(attachBrowse)
   return roots.map(finalizeNode)
 }
 
@@ -160,10 +175,7 @@ export function visibleSymbolRows(
   options: VisibleSymbolOptions,
 ): VisibleSymbolRow[] {
   const query = options.query.trim().toLocaleLowerCase()
-  const terms = query.split(/[,，;；\n]+/).map(term => term.trim()).filter(Boolean)
-  const matches = (path: string, type: string) => !terms.length || terms.some(term => (
-    path.toLocaleLowerCase().includes(term) || type.toLocaleLowerCase().includes(term)
-  ))
+  const matches = (path: string, type: string) => matchesSignal(query, path, type, options.alias?.(path) || '')
   const forceExpanded = Boolean(query) || options.selectedOnly
   const visible = new Map<string, boolean>()
   const selectedCounts = new Map<string, number>()

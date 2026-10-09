@@ -11,6 +11,7 @@ const offlineMocks = vi.hoisted(() => ({
   getSecurityStatus: vi.fn(),
   preview: vi.fn(),
   deploy: vi.fn(),
+  deploymentStatus: vi.fn(),
   trigger: vi.fn(),
 }))
 
@@ -25,7 +26,8 @@ vi.mock('../lib/filePicker', async importOriginal => ({
   pickFlmFile: pickerMocks.pickFlmFile,
 }))
 
-vi.mock('../composables/useOfflineFlashApi', () => ({
+vi.mock('../composables/useOfflineFlashApi', async importOriginal => ({
+  ...await importOriginal<typeof import('../composables/useOfflineFlashApi')>(),
   useOfflineFlashApi: () => offlineMocks,
 }))
 
@@ -77,6 +79,33 @@ describe('OfflineFlashView', () => {
     vi.stubGlobal('confirm', vi.fn(() => true))
   })
 
+  it('offers CTRL-AP recovery without a voltage control or post-download lock', async () => {
+    onlineMocks.searchTargets.mockResolvedValue([{
+      part_number: 'nRF54L15', vendor: 'Nordic', pack_id: '',
+      pack_version: '', installed: true, source: 'builtin',
+    }])
+    offlineMocks.getSecurityStatus.mockResolvedValue({
+      model: 'V4', part_number: 'nRF54L15', supported: true,
+      unlock_supported: true, lock_supported: false, family: 'nrf54l15-ctrl-ap', reason: '',
+      unlock_erases_flash: true, reversible_lock: false,
+      voltage_options_mv: [], default_voltage_mv: null, apply_method: 'ctrl-ap',
+    })
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+    await wrapper.get('.target-result').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="offline-security-voltage"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="offline-lock"]').attributes('disabled')).toBeDefined()
+    const unlock = wrapper.get<HTMLInputElement>('[data-testid="offline-unlock"]')
+    await unlock.setValue(true)
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('UICR')
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('不会切换目标供电电压')
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+    await flushPromises()
+    expect(unlock.element.checked).toBe(true)
+  })
+
   it('registers a top-level offline flash route', () => {
     const route = router.getRoutes().find(candidate => candidate.name === 'offline-flash')
     expect(route?.path).toBe('/offline-flash')
@@ -94,6 +123,21 @@ describe('OfflineFlashView', () => {
     expect(wrapper.get('[data-testid="offline-script-name"]').attributes('disabled')).toBeDefined()
     expect(wrapper.find('option[value="auto"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('keeps high clocks available when switching from V3 to updated V2', async () => {
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-model"]').setValue('V3')
+    const clock = wrapper.get('[data-testid="offline-clock"]')
+    expect(clock.find('option[value="20000000"]').exists()).toBe(true)
+    expect(clock.find('option[value="30000000"]').exists()).toBe(true)
+    await clock.setValue('30000000')
+    await wrapper.get('[data-testid="offline-model"]').setValue('V2')
+    expect(clock.element).toHaveProperty('value', '30000000')
+    expect(clock.find('option[value="20000000"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('新版固件')
+    wrapper.unmount()
   })
 
   it('provides multi-file firmware selection and editable BIN address and FLM bases', () => {
@@ -445,6 +489,59 @@ describe('OfflineFlashView', () => {
     expect(wrapper.text()).toContain('# generated preview')
   })
 
+  it('queries a lost deployment response without submitting again', async () => {
+    offlineMocks.preview.mockResolvedValue({
+      model: 'V4',
+      script_name: 'factory-download.py',
+      script: '# generated preview',
+    })
+    onlineMocks.searchTargets.mockResolvedValue([{
+      part_number: 'STM32F103RC', vendor: 'STMicroelectronics', pack_id: 'Keil.STM32F1xx_DFP',
+      pack_version: '2.4.1', installed: true, source: 'installed',
+    }])
+    offlineMocks.listAlgorithms.mockResolvedValue([{
+      id: 'profile-stm32f1', file_name: 'STM32F10x_1024.FLM',
+      flash_base: '0x08000000', ram_base: '0x20000000', source_kind: 'existing',
+      source_token: null, origin: 'MCU profile', available: true, on_probe: true,
+    }])
+    offlineMocks.deploy.mockRejectedValueOnce(new Error('response lost'))
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+    await wrapper.get('.target-result').trigger('click')
+    await flushPromises()
+    const input = wrapper.get('input[type="file"][multiple]')
+    Object.defineProperty(input.element, 'files', {
+      configurable: true,
+      value: [new File(['hex'], 'firmware.hex')],
+    })
+    await input.trigger('change')
+
+    await wrapper.get('[data-testid="offline-deploy"]').trigger('click')
+    await flushPromises()
+
+    expect(offlineMocks.deploy).toHaveBeenCalledOnce()
+    const id = wrapper.get<HTMLInputElement>('[data-testid="deployment-request-id"]').element.value
+    expect(id).toBe(offlineMocks.deploy.mock.calls[0][3])
+    expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeDefined()
+    offlineMocks.deploymentStatus.mockResolvedValue({ state: 'succeeded', result: {
+      status: 'deployed', model: 'V4', script_name: 'factory-download.py', files: ['app.hex'],
+    } })
+    await wrapper.get('[data-testid="deployment-query"]').trigger('click')
+    await flushPromises()
+    expect(offlineMocks.deploymentStatus).toHaveBeenCalledExactlyOnceWith(id)
+    expect(offlineMocks.deploy).toHaveBeenCalledOnce()
+    expect(wrapper.text()).toContain('已查询到部署成功记录')
+    offlineMocks.deploymentStatus.mockRejectedValueOnce(new Error('No retained deployment'))
+    await wrapper.get('[data-testid="deployment-request-id"]').setValue('missing-request')
+    await wrapper.get('[data-testid="deployment-query"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('No retained deployment')
+    expect(wrapper.text()).not.toContain('已查询到部署成功记录')
+    expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeDefined()
+    expect(offlineMocks.deploy).toHaveBeenCalledOnce()
+  })
+
   it('confirms security choices immediately and sends the validated V3 recipe', async () => {
     onlineMocks.searchTargets.mockResolvedValue([{
       part_number: 'GD32F303CET6', vendor: 'GigaDevice', pack_id: 'GigaDevice.GD32F30x_DFP',
@@ -600,7 +697,7 @@ describe('OfflineFlashView', () => {
     expect(wrapper.get('.trigger-log').text()).toContain('program finished')
   })
 
-  it('configures HPM BIN download without Pack or FLM algorithms', async () => {
+  it.each(['bin', 'hex'])('configures HPM %s download without Pack or FLM algorithms', async (format) => {
     onlineMocks.searchTargets.mockResolvedValue([{
       part_number: 'HPM5301xEGx', vendor: 'HPMicro', pack_id: null,
       pack_version: null, installed: true, source: 'builtin',
@@ -614,7 +711,7 @@ describe('OfflineFlashView', () => {
     const input = wrapper.get('input[type="file"][multiple]')
     Object.defineProperty(input.element, 'files', {
       configurable: true,
-      value: [new File(['bin'], 'app.bin')],
+      value: [new File(['firmware'], `app.${format}`)],
     })
     await input.trigger('change')
     await wrapper.get('[data-testid="offline-deploy"]').trigger('click')
@@ -628,6 +725,7 @@ describe('OfflineFlashView', () => {
     expect(payload.board).toBe('hpm5301evklite')
     expect(payload.algorithms).toEqual([])
     expect(payload.firmwares[0].algorithm_id).toBe('')
-    expect(payload.firmwares[0].base_address).toBe('0x80000400')
+    expect(payload.firmwares[0].base_address).toBe(format === 'bin' ? '0x80000400' : null)
+    expect(payload.firmwares[0].format).toBe(format)
   })
 })

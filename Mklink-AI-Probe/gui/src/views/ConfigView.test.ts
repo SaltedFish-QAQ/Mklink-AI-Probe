@@ -1,6 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { nextTick, readonly, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { sharedRuntime } from '../composables/useBackendHealth'
 
 const mocks = vi.hoisted(() => {
   const deviceStatus = {
@@ -27,8 +28,6 @@ const mocks = vi.hoisted(() => {
       upgradeProbeFirmware: vi.fn(),
       downloadProbeFirmware: vi.fn(),
     },
-    wsConnect: vi.fn(),
-    wsDisconnect: vi.fn(),
     toastError: vi.fn(),
     toastSuccess: vi.fn(),
     toastWarn: vi.fn(),
@@ -45,21 +44,15 @@ vi.mock('../composables/useMklinkApi', () => ({
   useMklinkApi: () => ({ deviceStatus: readonly(ref(mocks.deviceStatus)), ...mocks.api }),
 }))
 
-vi.mock('../composables/useMklinkWs', () => ({
-  useMklinkWs: () => ({
-    wsConnected: ref(false),
-    connect: mocks.wsConnect,
-    disconnect: mocks.wsDisconnect,
-  }),
-}))
-
 vi.mock('../composables/useToast', () => ({
   useToast: () => ({ error: mocks.toastError, success: mocks.toastSuccess, warn: mocks.toastWarn }),
 }))
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 
-vi.mock('../lib/runtimeEndpoint', () => ({ IS_TAURI: true }))
+vi.mock('../lib/runtimeEndpoint', () => ({
+  REMOTE_WINDOW_ID: null,
+  IS_REMOTE: false, IS_TAURI: true }))
 
 vi.mock('../lib/desktopSettings', async importOriginal => ({
   ...await importOriginal<typeof import('../lib/desktopSettings')>(),
@@ -91,6 +84,7 @@ async function mountView() {
     global: {
       stubs: {
         FirmwareUpdateModal: true,
+        RuntimePanel: true,
       },
     },
   })
@@ -99,7 +93,58 @@ async function mountView() {
 }
 
 describe('ConfigView', () => {
+  it.each(['TEST_PORT_B', ''])('keeps user selection %s when initial config arrives late', async selected => {
+    sharedRuntime.value = true
+    const pending = deferred<any>()
+    mocks.api.getConfig.mockReturnValueOnce(pending.promise)
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="local-port"]').setValue(selected)
+    pending.resolve({ com_port: 'TEST_PORT_A', swd_clock: '2000000' })
+    await flushPromises()
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="local-port"]').element.value).toBe(selected)
+    await wrapper.get('[data-testid="connect-local"]').trigger('click')
+    await flushPromises()
+    expect(mocks.api.connectDevice).toHaveBeenCalledWith(expect.objectContaining(
+      selected ? { port: selected } : { restore_last: true },
+    ))
+    wrapper.unmount()
+  })
+
+  it('keeps a connection result and an edited clock when initial config arrives late', async () => {
+    sharedRuntime.value = true
+    const pending = deferred<any>()
+    mocks.api.getConfig.mockReturnValueOnce(pending.promise)
+    mocks.api.connectDevice.mockResolvedValueOnce({ port: 'TEST_PORT_B' })
+    const wrapper = await mountView()
+    const clock = wrapper.get<HTMLInputElement>('[data-testid="swd-clock"]')
+    clock.element.value = '1000000'
+    await clock.trigger('input')
+    await wrapper.get('[data-testid="connect-local"]').trigger('click')
+    await flushPromises()
+    pending.resolve({ com_port: 'TEST_PORT_A', swd_clock: '2000000' })
+    await flushPromises()
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="local-port"]').element.value).toBe('TEST_PORT_B')
+    expect(clock.element.value).toBe('1000000')
+    wrapper.unmount()
+  })
+
+  it('switches a shared probe while the current target remains connected', async () => {
+    sharedRuntime.value = true
+    Object.assign(mocks.deviceStatus, { connected: true, port: 'TEST_PORT_A' })
+    const wrapper = await mountView()
+    expect(wrapper.get('[data-testid="connect-local"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="local-port"]').setValue('TEST_PORT_B')
+    expect(wrapper.get('[data-testid="connect-local"]').text()).toContain('切换下载器')
+    expect(wrapper.get('[data-testid="connect-local"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('[data-testid="connect-local"]').trigger('click')
+    await flushPromises()
+    expect(mocks.api.connectDevice).toHaveBeenCalledWith(expect.objectContaining({ port: 'TEST_PORT_B' }))
+    expect(mocks.api.disconnectDevice).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
   beforeEach(() => {
+    sharedRuntime.value = false
     vi.clearAllMocks()
     mocks.api.parseAxf.mockReset()
     mocks.api.findRtt.mockReset()
@@ -151,10 +196,10 @@ describe('ConfigView', () => {
     vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
   })
 
-  it('renders one five-section workspace with Local Device selected by default', async () => {
+  it('renders one four-section workspace with Local Device selected by default', async () => {
     const wrapper = await mountView()
 
-    expect(wrapper.findAll('[data-testid="config-section"]')).toHaveLength(5)
+    expect(wrapper.findAll('[data-testid="config-section"]')).toHaveLength(3)
     expect(wrapper.get('[data-testid="config-section-local"]').attributes('aria-current')).toBe('page')
     expect(wrapper.get('[data-testid="local-device-panel"]').exists()).toBe(true)
 
@@ -296,7 +341,25 @@ describe('ConfigView', () => {
     })
   })
 
-  it('switches a failed strict connection to Auto Search for the next attempt', async () => {
+  it('shows shared owners and opens management without evicting them', async () => {
+    sharedRuntime.value = true
+    mocks.deviceStatus.connected = true
+    mocks.api.disconnectDevice.mockRejectedValueOnce(Object.assign(new Error('shared'), {
+      detail: { reason: 'shared_clients_attached', clients: [{ name: 'VS Code', kind: 'mcp' }] },
+    }))
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="disconnect-local"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="connection-owners"]').text()).toContain('VS Code (mcp)')
+    expect(mocks.toastError).not.toHaveBeenCalled()
+    expect(mocks.api.disconnectDevice).toHaveBeenCalledOnce()
+    await wrapper.get('[data-testid="manage-connection-owners"]').trigger('click')
+    expect(wrapper.get('[data-testid="config-section-runtime"]').attributes('aria-current')).toBe('page')
+    expect(mocks.api.disconnectDevice).toHaveBeenCalledOnce()
+    wrapper.unmount()
+  })
+
+  it('preserves a failed strict selection for the next attempt', async () => {
     mocks.api.connectDevice
       .mockRejectedValueOnce(new Error('selected port unavailable'))
       .mockResolvedValueOnce({ port: 'TEST_PORT_A' })
@@ -311,13 +374,13 @@ describe('ConfigView', () => {
       port: 'TEST_PORT_B',
       axf: 'C:\\saved\\app.axf',
     })
-    expect(wrapper.get<HTMLSelectElement>('[data-testid="local-port"]').element.value).toBe('')
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="local-port"]').element.value).toBe('TEST_PORT_B')
 
     await wrapper.get('[data-testid="connect-local"]').trigger('click')
     await flushPromises()
 
     expect(mocks.api.connectDevice).toHaveBeenNthCalledWith(2, {
-      restore_last: true,
+      port: 'TEST_PORT_B',
       axf: 'C:\\saved\\app.axf',
     })
   })
@@ -366,6 +429,49 @@ describe('ConfigView', () => {
     await wrapper.get('[data-testid="swd-clock"]').setValue(hz)
     await flushPromises()
     expect(mocks.api.updateConfig).toHaveBeenCalledWith(expect.objectContaining({ swd_clock: hz }))
+  })
+
+  it('keeps an uncertain save visible without resending after a lost response', async () => {
+    const wrapper = await mountView()
+    mocks.api.updateConfig.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    vi.useFakeTimers()
+    try {
+      await wrapper.get('[data-testid="swd-clock"]').setValue('4000000')
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(1500)
+      await flushPromises()
+      expect(mocks.api.updateConfig).toHaveBeenCalledTimes(1)
+      expect(wrapper.get('[data-testid="local-auto-save"]').text()).toContain('保存未确认')
+      expect(mocks.toastError).toHaveBeenCalledWith(expect.stringContaining('Failed to fetch'))
+      expect(wrapper.get('[data-testid="swd-clock"]').attributes('disabled')).toBeUndefined()
+
+      mocks.api.updateConfig.mockResolvedValueOnce({ swd_clock: '2000000' })
+      await wrapper.get('[data-testid="swd-clock"]').setValue('2000000')
+      await flushPromises()
+      expect(mocks.api.updateConfig).toHaveBeenCalledTimes(2)
+      expect(wrapper.get('[data-testid="local-auto-save"]').text()).toContain('已自动保存')
+    } finally {
+      wrapper.unmount()
+      vi.useRealTimers()
+    }
+  })
+
+  it('admits one save at a time and disables editable connection settings until it settles', async () => {
+    const wrapper = await mountView()
+    const pending = deferred<any>()
+    mocks.api.updateConfig.mockReturnValueOnce(pending.promise)
+    const clock = wrapper.get('[data-testid="swd-clock"]')
+    await clock.setValue('4000000')
+    expect(clock.attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="local-port"]').attributes('disabled')).toBeDefined()
+    await clock.trigger('change')
+    expect(mocks.api.updateConfig).toHaveBeenCalledTimes(1)
+    pending.resolve({ swd_clock: '4000000' })
+    await flushPromises()
+    expect(clock.attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="local-port"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="local-auto-save"]').text()).toContain('已自动保存')
+    wrapper.unmount()
   })
 
   it('rejects unnamed high clocks', async () => {
@@ -601,30 +707,24 @@ describe('ConfigView', () => {
     expect(wrapper.get('[data-testid="parse-symbols"]').attributes('disabled')).toBeDefined()
   })
 
-  it('keeps remote connection and service launch controls reachable', async () => {
+  it('places backend management last and removes the legacy remote connector', async () => {
+    sharedRuntime.value = true
     const wrapper = await mountView()
-
-    await wrapper.get('[data-testid="config-section-remote"]').trigger('click')
-    await wrapper.get('[data-testid="remote-url"]').setValue('ws://10.0.0.5:8765')
-    await wrapper.get('[data-testid="remote-token"]').setValue('secret')
-    await wrapper.get('[data-testid="connect-remote"]').trigger('click')
-    expect(mocks.wsConnect).toHaveBeenCalledWith('secret', 'ws://10.0.0.5:8765')
-
-    await wrapper.get('[data-testid="config-section-serve"]').trigger('click')
-    await wrapper.get('[data-testid="serve-host"]').setValue('0.0.0.0')
-    await wrapper.get('[data-testid="serve-port"]').setValue('9000')
-    await wrapper.get('[data-testid="launch-server"]').trigger('click')
-    expect(window.open).toHaveBeenCalledWith('http://0.0.0.0:9000/docs', '_blank')
+    expect(wrapper.findAll('[data-testid="config-section"]').map(item => item.text())).toEqual([
+      '本地设备', '文件来源', '固件升级', '后台管理',
+    ])
+    expect(wrapper.find('[data-testid="probe-alias"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="config-section-remote"]').exists()).toBe(false)
+    wrapper.unmount()
   })
 
-  it('keeps firmware update as a separate sidebar section after Start Service', async () => {
+  it('keeps firmware update as a separate sidebar section alongside local settings', async () => {
     const wrapper = await mountView()
     const sections = wrapper.findAll('[data-testid="config-section"]')
 
     expect(sections.map(section => section.text())).toEqual([
-      '本地设备', '文件来源', '远程连接', '启动服务', '固件升级',
+      '本地设备', '文件来源', '固件升级',
     ])
-    await wrapper.get('[data-testid="config-section-serve"]').trigger('click')
     expect(wrapper.find('[data-testid="firmware-upgrade-panel"]').exists()).toBe(false)
 
     await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
@@ -682,6 +782,8 @@ describe('ConfigView', () => {
 
     expect(wrapper.get('[data-testid="manual-firmware-download"]').text()).toContain('最新固件：V3.3.7')
     expect(wrapper.get('[data-testid="firmware-upgrade-status"]').text()).toContain('未检测到 Bootloader U 盘')
+    expect(mocks.toastError).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-testid="firmware-manual-steps"]').text()).toContain('按住升级按键')
 
     await wrapper.get('[data-testid="download-firmware"]').trigger('click')
     await flushPromises()
@@ -689,5 +791,35 @@ describe('ConfigView', () => {
     expect(mocks.api.downloadProbeFirmware).toHaveBeenCalledWith('V3', 'microlink')
     expect(mocks.saveBlobFile).toHaveBeenCalledWith('MicroLink_V3.3.7.uf2', blob)
     expect(wrapper.get('[data-testid="firmware-download-status"]').text()).toContain('Gitee')
+  })
+
+  it('offers explicit firmware model selection when an old probe cannot be identified', async () => {
+    mocks.api.upgradeProbeFirmware.mockResolvedValueOnce({ status: 'manual_required', message: '暂时无法识别下载器' })
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="download-firmware"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="firmware-model-choice"]').setValue('hpm')
+    expect(wrapper.get('[data-testid="download-firmware"]').attributes('disabled')).toBeUndefined()
+    mocks.api.downloadProbeFirmware.mockResolvedValueOnce({ blob: new Blob(), filename: 'HPMLink_V4.6.0.uf2', source: 'github' })
+    await wrapper.get('[data-testid="download-firmware"]').trigger('click')
+    await flushPromises()
+    expect(mocks.api.downloadProbeFirmware).toHaveBeenCalledWith('V4', 'hpmlink')
+    expect(mocks.toastError).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('shows verified automatic update success without manual fallback', async () => {
+    mocks.api.upgradeProbeFirmware.mockResolvedValueOnce({ status: 'updated', verified_version: 'V4.6.0' })
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="firmware-upgrade-status"]').text()).toContain('升级完成：V4.6.0')
+    expect(wrapper.find('[data-testid="manual-firmware-download"]').exists()).toBe(false)
+    expect(mocks.toastSuccess).toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+    wrapper.unmount()
   })
 })

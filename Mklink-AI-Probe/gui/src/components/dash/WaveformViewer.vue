@@ -17,6 +17,8 @@ import viewerUrl from '../../assets/rtt_viewer.js?url'
 import { language } from '../../composables/useLanguage'
 import { API_BASE } from '../../lib/runtimeEndpoint'
 import { saveTextFile } from '../../lib/downloadTextFile'
+import { mountReplayButton } from '../../../../mklink/static/superwatch_replay.js'
+import '../../../../mklink/static/superwatch_replay.css'
 
 const props = defineProps<{
   mode: 'SuperWatch' | 'VOFA'
@@ -32,7 +34,7 @@ const emit = defineEmits<{
 const container = ref<HTMLDivElement>()
 const binary = useBinaryStream(
   props.mode === 'VOFA' ? 'vofa' : 'superwatch',
-  { capacity: 200000, channelCount: 1 },
+  { capacity: props.mode === 'VOFA' ? 10000 : 50000, channelCount: 1 },
 )
 let vofaChannels: Array<Record<string, unknown>> = []
 let vofaChannelSignature: string | null = null
@@ -50,6 +52,7 @@ let latestVofaStatus: Record<string, unknown> | null = null
 let arraySnapshotTimer: ReturnType<typeof setTimeout> | null = null
 let arraySnapshotGeneration = 0
 let disposed = false
+let disposeReplay: (() => void) | null = null
 function requestLatestVisibleRange(interactive = false): void {
   if (visibleRequestInFlight !== null) {
     visibleRangePending = true
@@ -79,6 +82,7 @@ function resetVisibleRangeRequests(): void {
 const vofaScheduler = new RenderScheduler(() => requestLatestVisibleRange(false))
 
 function attachSuperwatchRequesters(viewer: any): void {
+  viewer?.setBinaryCapacityRequester?.((capacity: number) => binary.resizeWaveform(capacity))
   if (props.mode !== 'SuperWatch' || !viewer) return
   viewer.setBinaryHistoryRequester?.(() => {
     binary.requestHistorySnapshot?.(++historyRequestId)
@@ -87,6 +91,10 @@ function attachSuperwatchRequesters(viewer: any): void {
     binary.setWaveformDetail?.(enabled)
   })
   viewer.setBinaryVisibleRangeRequester?.(() => requestLatestVisibleRange(true))
+  viewer.setBinaryFreezeRequester?.((frozen: boolean) => {
+    resetVisibleRangeRequests()
+    binary.setWaveformFrozen?.(frozen)
+  })
 }
 
 function channelSignature(channels: readonly Record<string, unknown>[]): string {
@@ -209,12 +217,18 @@ function startVofaStatusPolling(startTransport: boolean): void {
 function onVofaStreamState(event: Event): void {
   const state = (event as CustomEvent<unknown>).detail
   if (state === 'running') {
-    if (props.mode === 'SuperWatch') binary.stop()
+    binary.stop()
     resetVofaSession()
-    if (props.mode === 'SuperWatch') binary.start()
+    binary.start()
     startVofaStatusPolling(false)
   } else if (state === 'stopped') {
     pendingBatch = null
+    // Stop the shared producer, not this window's subscription. Another GUI
+    // can start it again; retain history while still receiving status/metadata.
+    if (props.mode === 'SuperWatch') {
+      startVofaStatusPolling(false)
+      return
+    }
     binary.stop()
     stopVofaStatusPolling()
   }
@@ -319,6 +333,9 @@ onMounted(() => {
 
   // 1. Inject HTML template
   el.innerHTML = buildTemplate(props.mode)
+  if (props.mode === 'SuperWatch') {
+    disposeReplay = mountReplayButton(el.querySelector('.header-actions') as HTMLElement, { language: language.value })
+  }
 
   // 2. Inject CONFIG + load scripts
   injectScripts(el, props.mode)
@@ -348,6 +365,7 @@ watch(language, value => {
 })
 
 onUnmounted(() => {
+  disposeReplay?.()
   disposed = true
   stopVofaStatusPolling()
   stopArraySnapshotPolling()
@@ -403,7 +421,7 @@ function buildTemplate(mode: string): string {
   <span id="collection-status-badge" class="status-running" data-i18n="running">Running</span>
   <div class="ctrl-sep"></div>
   <label data-i18n="buffer">Buffer</label>
-  <input type="number" id="buffer-input" value="${maxPoints}" min="${minPoints}" max="1000000" step="10000">
+  <input type="number" id="buffer-input" value="${maxPoints}" min="${minPoints}" max="1000000" step="1">
   <span class="buffer-unit">pts/ch</span>
   <span id="buffer-memory-estimate" class="buffer-memory-estimate" data-i18n-title="buffer_memory_tip">~0 MB</span>
   <button id="btn-apply-buffer" class="ctrl-btn" data-i18n="apply">Apply</button>
@@ -441,7 +459,7 @@ function buildTemplate(mode: string): string {
   </select>
   <div class="trigger-sep"></div>
   <label data-i18n="pretrig">Pre-trig</label>
-  <input type="number" id="trigger-pretrig" value="1000" min="10" max="50000" step="100">
+  <input type="number" id="trigger-pretrig" value="1000" min="10" max="50000" step="1">
   <div class="trigger-sep"></div>
   <button id="trigger-force-btn" data-i18n="force_trigger">Force Trigger</button>
 </div>
@@ -612,6 +630,7 @@ function injectScripts(el: HTMLDivElement, mode: string) {
   const i18nScript = document.createElement('script')
   i18nScript.src = i18nUrl
   i18nScript.onload = () => {
+    if (disposed) return
     // DOMContentLoaded already fired, call applyI18n manually
     if (typeof (window as any).setLang === 'function') {
       ;(window as any).setLang(language.value)
@@ -626,6 +645,7 @@ function loadViewerScript(el: HTMLDivElement) {
   const viewerScript = document.createElement('script')
   viewerScript.src = viewerUrl
   viewerScript.onload = () => {
+    if (disposed) return
     // Store es reference for cleanup (var es leaks to window in classic scripts)
     const viewers = (window as any).__waveformViewers
     if (viewers && !viewers[props.mode]) {

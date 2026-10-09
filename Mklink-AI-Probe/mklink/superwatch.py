@@ -18,6 +18,7 @@ import webbrowser
 import xml.etree.ElementTree as ET
 
 from mklink.memory_access import parse_read_ram_response, read_memory
+from mklink.mux_watch import PackedWatchSample
 from mklink.watch import decode_value, resolve_variable_path
 
 
@@ -84,17 +85,35 @@ class CompiledFrameDecoder:
         self,
         channel_names: tuple[str, ...],
         region_fields: tuple[tuple[CompiledDecodeField, ...], ...],
+        region_sizes: tuple[int, ...] = (),
     ):
         self.channel_names = channel_names
         self.channel_index = {name: index for index, name in enumerate(channel_names)}
         self.region_fields = region_fields
         self._values = [0.0] * len(channel_names)
-        self._seen = [0] * len(channel_names)
-        self._generation = 0
+        self._region_masks = tuple(sum({1 << field.channel_index for field in fields})
+                                   for fields in region_fields)
+        self._complete_mask = (1 << len(channel_names)) - 1
+        self._packed_fields = []
+        offset = 0
+        for size, fields in zip(region_sizes, region_fields):
+            self._packed_fields.extend((offset + f.offset, f) for f in fields)
+            offset += size
+        self._packed_size = offset
+        self._packed_complete = {f.channel_index for _, f in self._packed_fields} == set(range(len(channel_names)))
 
-    def decode(self, frame: dict) -> list[float] | None:
-        self._generation += 1
-        generation = self._generation
+    def decode(self, frame: dict | PackedWatchSample) -> list[float] | None:
+        if isinstance(frame, PackedWatchSample):
+            if (not self._packed_complete or not self._packed_size or frame.offset < 0
+                    or frame.offset + self._packed_size > len(frame.payload)):
+                return None
+            for offset, field in self._packed_fields:
+                value = field.unpacker.unpack_from(frame.payload, frame.offset + offset)[0]
+                if field.bit_mask is not None:
+                    value = (int(value) >> field.bit_offset) & field.bit_mask
+                self._values[field.channel_index] = float(value)
+            return self._values
+        seen = 0
         for region_index, region_data in frame.get("regions", ()):
             if not 0 <= region_index < len(self.region_fields):
                 continue
@@ -105,8 +124,8 @@ class CompiledFrameDecoder:
                 if field.bit_mask is not None:
                     value = (int(value) >> field.bit_offset) & field.bit_mask
                 self._values[field.channel_index] = float(value)
-                self._seen[field.channel_index] = generation
-        if any(marker != generation for marker in self._seen):
+            seen |= self._region_masks[region_index]
+        if seen != self._complete_mask:
             return None
         return self._values
 
@@ -131,9 +150,11 @@ def parse_timestamped_read_ram_response(response: str) -> TimestampedRead:
     match = _TIMESTAMP_RE.search(response)
     timestamp_us = int(match.group(1), 0) if match else None
     data = bytearray()
+    header_seen = False
     for line in response.splitlines():
         header = _TIMESTAMP_HEADER_RE.match(line)
-        if header:
+        if header and not header_seen and not data:
+            header_seen = True
             if timestamp_us is None:
                 timestamp_us = int(header.group(1), 16)
             continue
@@ -151,7 +172,10 @@ def parse_timestamped_read_ram_response(response: str) -> TimestampedRead:
     )
 
 
-def build_read_blocks(items: list[WatchItem], *, max_gap: int = 16) -> list[ReadBlock]:
+def build_read_blocks(
+    items: list[WatchItem], *, max_gap: int = 16,
+    ram_ranges: tuple[tuple[int, int], ...] = (),
+) -> list[ReadBlock]:
     if not items:
         return []
     sorted_items = sorted(items, key=lambda i: (i.source != "ram", i.address))
@@ -171,19 +195,29 @@ def build_read_blocks(items: list[WatchItem], *, max_gap: int = 16) -> list[Read
         current_source = ""
 
     for item in sorted_items:
+        item_start = item.address
         item_end = item.address + max(1, item.size)
+        # Only widen reads within a known writable ELF/profile RAM range.
+        # Decoding still uses each item's original address/width, including
+        # packed values crossing a word boundary. Never widen MMIO accesses.
+        aligned_start = item_start & ~3
+        aligned_end = (item_end + 3) & ~3
+        if (item.source == "ram" and aligned_end - aligned_start <= 128
+                and any(start <= aligned_start and aligned_end <= end
+                        for start, end in ram_ranges)):
+            item_start, item_end = aligned_start, aligned_end
         if (
             current_items
             and item.source == current_source
             and (item.source == "ram" or item.address == current_start)
-            and item.address <= current_end + max_gap
+            and item_start <= current_end + max_gap
         ):
             current_items.append(item)
             current_end = max(current_end, item_end)
             continue
         flush()
         current_items = [item]
-        current_start = item.address
+        current_start = item_start
         current_end = item_end
         current_source = item.source
     flush()
@@ -244,7 +278,7 @@ def compile_frame_decoder(
                 bit_offset, (1 << bit_width) - 1 if bit_width is not None else None,
             ))
         region_fields.append(tuple(fields))
-    return CompiledFrameDecoder(channel_names, tuple(region_fields))
+    return CompiledFrameDecoder(channel_names, tuple(region_fields), tuple(block.size for block in blocks))
 
 
 def _read_block_via_bridge(bridge, address: int, size: int, *, timeout: float = 10.0) -> tuple[bytes, str]:
@@ -683,12 +717,13 @@ class SuperWatchRuntime:
         self.items = list(items)
         self.dwarf_info = dwarf_info
         self.symbol_catalog = symbol_catalog
+        self.ram_ranges = tuple(getattr(symbol_catalog, "_ram_ranges", ()))
         self.svd_registers = svd_registers or {}
         self.peripheral_items = peripheral_items or {}
         self.port = port
         self.read_lock = read_lock or threading.Lock()
         self.blocks = build_read_blocks(
-            self.items, max_gap=SUPERWATCH_DUMP_MERGE_GAP,
+            self.items, max_gap=SUPERWATCH_DUMP_MERGE_GAP, ram_ranges=self.ram_ranges,
         )
         self.blocks_version = 0
 
@@ -732,7 +767,7 @@ class SuperWatchRuntime:
                 break
         return results
 
-    def add(self, name: str) -> dict:
+    def add(self, name: str, *, validate_layout=None) -> dict:
         existing = next((item for item in self.items if item.name == name), None)
         if existing is not None:
             return {"name": existing.name, **make_channel_metadata([existing])[existing.name]}
@@ -754,6 +789,8 @@ class SuperWatchRuntime:
                 ),
             )
         else:
+            if self.symbol_catalog is not None and self.symbol_catalog.is_overridden(name):
+                return {"error": f"Cannot resolve '{name}': unavailable in the active C layout"}
             try:
                 resolved = resolve_watch_items(
                     [name],
@@ -765,20 +802,40 @@ class SuperWatchRuntime:
             if not resolved:
                 return {"error": f"Cannot resolve '{name}': skipped (address outside SRAM or not found)"}
             item = resolved[0]
-        self.items.append(item)
-        self.blocks = build_read_blocks(
-            self.items, max_gap=SUPERWATCH_DUMP_MERGE_GAP,
-        )
+        # Validate before publishing a new sampling layout: an invalid item must
+        # not stop the worker or displace the existing valid channels.
+        if item.scalar_kind in {"array", "struct", "union"}:
+            return {"error": f"Cannot watch '{name}' as a scalar; select a member or use an array snapshot"}
+        candidate_items = [*self.items, item]
+        try:
+            candidate_blocks = build_read_blocks(
+                candidate_items, max_gap=SUPERWATCH_DUMP_MERGE_GAP, ram_ranges=self.ram_ranges,
+            )
+            compile_frame_decoder(candidate_items, candidate_blocks)
+        except ValueError as exc:
+            return {"error": f"Cannot watch '{name}': {exc}; select a scalar member or use an array snapshot"}
+        try:
+            if validate_layout is not None:
+                validate_layout(candidate_items)
+        except ValueError as exc:
+            return {"error": f"Cannot watch '{name}': {exc}"}
+        self.items = candidate_items
+        self.blocks = candidate_blocks
         self.blocks_version += 1
         return {"name": item.name, **make_channel_metadata([item])[item.name]}
 
-    def remove(self, name: str) -> dict:
-        before = len(self.items)
-        self.items = [item for item in self.items if item.name != name]
-        if len(self.items) == before:
+    def remove(self, name: str, *, validate_layout=None) -> dict:
+        candidate_items = [item for item in self.items if item.name != name]
+        if len(candidate_items) == len(self.items):
             return {"removed": False, "name": name}
+        try:
+            if validate_layout is not None:
+                validate_layout(candidate_items)
+        except ValueError as exc:
+            return {"error": str(exc), "removed": False, "name": name}
+        self.items = candidate_items
         self.blocks = build_read_blocks(
-            self.items, max_gap=SUPERWATCH_DUMP_MERGE_GAP,
+            self.items, max_gap=SUPERWATCH_DUMP_MERGE_GAP, ram_ranges=self.ram_ranges,
         )
         self.blocks_version += 1
         return {"removed": True, "name": name}
@@ -846,6 +903,78 @@ class SuperWatchRuntime:
         return results
 
 
+def _run_visualizer_stream(bridge, server, runtime, stop_event, reconfigure,
+                           *, clock=time.monotonic, stall_timeout=5.0, max_recoveries=3):
+    """Keep the standalone stream observable and recover bounded session faults."""
+    from mklink.dump_memory import DumpMemoryStreamSession, decode_frame_to_points
+
+    failures = 0
+    origin_us = None
+    while not stop_event.is_set():
+        blocks = runtime.blocks
+        if not blocks:
+            server.set_stream_health("stopped", "No blocks to monitor")
+            return
+        reconfigure.clear()
+        version = runtime.blocks_version
+        period = server._interval
+        layout = [(block.address, block.size, [
+            (item.name, item.type_name, item.address - block.address, item.size,
+             item.scalar_kind, item.enum_values) for item in block.items
+        ]) for block in blocks]
+        session = DumpMemoryStreamSession(bridge, [(b.address, b.size) for b in blocks], period)
+        started = last_valid = clock()
+        fault = None
+        stop_failed = False
+        try:
+            session.start()
+            while not stop_event.is_set():
+                if runtime.blocks_version != version or reconfigure.is_set():
+                    break
+                # Always drain paused streams so they cannot accumulate in the bridge.
+                frames = session.read_frames()
+                for frame in frames:
+                    points, origin_us = decode_frame_to_points(frame, layout, origin_us)
+                    if not points:
+                        raise ValueError("dump_memory returned no variable values")
+                    last_valid = clock()
+                    if last_valid - started >= 30:
+                        failures = 0
+                    if server.collecting.is_set():
+                        for point in points:
+                            server.push_data_point(point)
+                if clock() - last_valid > max(stall_timeout, 3 * period):
+                    raise TimeoutError("SuperWatch received no valid samples before timeout")
+                if not frames:
+                    stop_event.wait(0.005)
+        except Exception as exc:
+            fault = str(exc)
+        finally:
+            try:
+                session.stop()
+            except Exception as exc:
+                # No new command may be sent until command mode is synchronized.
+                server.set_stream_health("error", "Stream stop failed: " + str(exc))
+                server.push_event("error", {"message": "Stream stop failed: " + str(exc)})
+                stop_failed = True
+        if stop_failed:
+            return
+        if stop_event.is_set():
+            return
+        if fault:
+            failures += 1
+            server.push_event("error", {"message": fault, "recovery_attempt": failures})
+            if failures > max_recoveries:
+                server.set_stream_health("error", fault + "; recovery limit reached")
+                return
+            server.set_stream_health("recovering", fault)
+            if stop_event.wait(min(failures * 0.25, 1.0)):
+                return
+        # A recovered or reconfigured session gets a fresh timeline.
+        origin_us = None
+        server.push_event("stream_reset", {})
+
+
 def run_superwatch_visualizer(
     *,
     items: list[WatchItem],
@@ -892,7 +1021,6 @@ def run_superwatch_visualizer(
     server._interval = period
     stop_event = threading.Event()
     _interval_changed = threading.Event()
-    origin_us: int | None = None
     actual_port = server.start()
     url = f"http://{host}:{actual_port}"
     print(f"[OK] SuperWatch Viewer started: {url}")
@@ -900,113 +1028,22 @@ def run_superwatch_visualizer(
         webbrowser.open(url)
 
     def _poll_loop() -> None:
-        nonlocal origin_us
         from mklink.bridge import MKLinkSerialBridge
         from mklink.cli import _resolve_port
 
         resolved_port = _resolve_port(port)
         bridge = MKLinkSerialBridge(resolved_port)
         if not bridge.connect():
+            server.set_stream_health("error", "Bridge connect failed")
             server.push_event("error", {"message": "Bridge connect failed"})
             return
         try:
-            _dump_mem_poll_loop(bridge, server, runtime, origin_us, stop_event, read_lock)
+            _run_visualizer_stream(bridge, server, runtime, stop_event, _interval_changed)
+        except Exception as exc:
+            server.set_stream_health("error", str(exc))
+            server.push_event("error", {"message": str(exc)})
         finally:
             bridge.close()
-
-    def _dump_mem_poll_loop(bridge, server, runtime, origin_us_ref, stop_event, read_lock) -> None:
-        nonlocal origin_us
-        from mklink._types import DeviceState
-        from mklink.dump_memory import (
-            DUMP_MEMORY_STOP_PERIOD,
-            DumpMemoryParser,
-            build_dump_mem_command,
-            decode_frame_to_points,
-        )
-
-        # Build block-to-region mapping
-        blocks = runtime.blocks
-        if not blocks:
-            server.push_event("error", {"message": "No blocks to monitor"})
-            return
-
-        region_pairs = [(b.address, b.size) for b in blocks]
-        period = server._interval  # already in seconds
-        cmd = build_dump_mem_command(region_pairs, period)
-
-        # Probe the command before switching the serial bridge to binary mode.
-        try:
-            resp = bridge.send_command(cmd, timeout=5.0)
-        except Exception:
-            resp = "Error"
-
-        if "Error" in resp or resp.strip() == "-1":
-            server.push_event("error", {
-                "message": (
-                    "SuperWatch requires cmd.dump_memory binary streaming; "
-                    "read_ram fallback is disabled"
-                ),
-            })
-            stop_event.set()
-            return
-
-        # Device accepted — it's now streaming binary frames.
-        # Enter binary stream mode (any text left in buffer will be
-        # skipped by the MAGIC sync in the parser).
-        bridge._enter_stream(DeviceState.DUMP_STREAM)
-
-        # Build per-region item info for decode_frame_to_points
-        block_addresses = []
-        for block in blocks:
-            items_info = [
-                (item.name, item.type_name, item.address - block.address, item.enum_values)
-                for item in block.items
-            ]
-            block_addresses.append((block.address, block.size, items_info))
-
-        parser = DumpMemoryParser(region_sizes=[b.size for b in blocks])
-        initial_version = runtime.blocks_version
-
-        try:
-            while not stop_event.is_set():
-                # Detect blocks change (add/remove from web UI)
-                if runtime.blocks_version != initial_version:
-                    break  # Exit to reconfigure
-
-                if not server.collecting.is_set():
-                    stop_event.wait(timeout=0.05)
-                    continue
-
-                try:
-                    raw = bridge.drain_stream_bytes()
-                    if not raw:
-                        time.sleep(0.001)
-                        continue
-                    frames = parser.feed(raw)
-                    for frame in frames:
-                        points, origin_us = decode_frame_to_points(
-                            frame, block_addresses, origin_us,
-                        )
-                        for point in points:
-                            server.push_data_point(point)
-                except Exception as exc:
-                    server.push_event("error", {"message": str(exc)})
-                    break
-        finally:
-            # Use the firmware's explicit stop value.  period=0 requests one
-            # additional sample and can leave it queued for the next command.
-            try:
-                bridge._exit_stream()
-                stop_cmd = build_dump_mem_command(
-                    region_pairs, DUMP_MEMORY_STOP_PERIOD,
-                )
-                bridge.send_command(stop_cmd, timeout=3.0)
-            except Exception:
-                pass
-
-        # If we exited due to blocks change, re-enter
-        if runtime.blocks_version != initial_version and not stop_event.is_set():
-            _dump_mem_poll_loop(bridge, server, runtime, origin_us, stop_event, read_lock)
 
     thread = threading.Thread(target=_poll_loop, daemon=True)
     thread.start()

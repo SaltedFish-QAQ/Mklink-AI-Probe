@@ -40,6 +40,12 @@ export interface OfflineFirmwareConfig {
   source_path?: string | null
 }
 
+export interface HpmOfflineOtp {
+  words: { word: number; expected: string; desired: string }[]
+  locks: number[]
+  expected_hard_lock: string
+  confirm_irreversible: boolean
+}
 export interface OfflineConfigPayload {
   model: 'V2' | 'V3' | 'V4'
   port?: string | null
@@ -55,11 +61,13 @@ export interface OfflineConfigPayload {
   lock_after_download: boolean
   security_voltage_mv: number | null
   option_bytes?: Record<string, number | string>
+  hpm_user_otp?: HpmOfflineOtp
   algorithms: OfflineAlgorithmConfig[]
   firmwares: OfflineFirmwareConfig[]
 }
 
 export interface OfflineSecurityCapability {
+  apply_method?: 'ctrl-ap'
   model: string
   part_number: string
   supported: boolean
@@ -80,13 +88,17 @@ export interface OfflinePreview {
 }
 
 export interface OfflineDeployResult {
+  acquisition?: { errors: string[] }
   status: 'deployed'
   model: 'V2' | 'V3' | 'V4'
   script_name: string
   files: string[]
+  file_count?: number
+  truncated?: boolean
 }
 
 export interface OfflineTriggerResult {
+  acquisition?: { errors: string[] }
   status: 'completed' | 'failed'
   lines: string[]
 }

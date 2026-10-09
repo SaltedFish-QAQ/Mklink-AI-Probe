@@ -58,6 +58,8 @@ These paths are relative to the main checkout, shared across worktrees.
 
 `--bundle` must force a fresh PyInstaller sidecar and collect:
 
+- freshly built `gui/dist` at the same path inside the frozen sidecar, so the
+  installed backend serves the Web GUI as well as the native desktop UI;
 - `mklink` package data;
 - pyOCD plugins and package metadata;
 - `cmsis_pack_manager` native/runtime data;
@@ -87,6 +89,8 @@ Generate only the standard NSIS by default. MSI and WebView2-offline variants re
    bundle also requires its updater signature. A local bundle deliberately has none.
 2. Install NSIS with a PATH containing only Windows system directories.
 3. Start the installed app and verify `GET /api/health` returns `status=ok`.
+   Open `/dashboard` in a real browser and verify its production scripts load;
+   a working native window alone does not prove the sidecar contains Web assets.
 4. Verify `GET /api/online-flash/probes` runs without exposing complete probe identifiers in evidence.
 5. Verify the process tree contains no `python.exe` or `pythonw.exe`.
 6. Close normally and verify Mklink processes and port `8765` are released.
@@ -94,6 +98,10 @@ Generate only the standard NSIS by default. MSI and WebView2-offline variants re
 8. Confirm the sidecar and public Skill ZIP each contain the validated catalog
    with 7,059 targets and 2,224 content-deduplicated FLM blobs. No target with a
    missing main programming algorithm may be shipped.
+9. Start the installed `mklink-sidecar.exe mcp` through a real stdio MCP client
+   with the Windows-only PATH. Complete initialization and call `inspect_mcu`
+   and `security_status` without opening hardware. The source/Skill MCP process
+   is a separate entry point and cannot substitute for this frozen check.
 
 Do not use the removed `/api/dashboard/status` endpoint. Use the current `/api/dash/<name>/status` routes when a dashboard-specific check is needed.
 

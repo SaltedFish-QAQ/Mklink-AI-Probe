@@ -9,6 +9,82 @@ export interface ReleaseHistoryEntry {
 
 export const releaseHistory: ReleaseHistoryEntry[] = [
   {
+    version: '0.3.1', date: '2026-10-08',
+    summary: '改善连接恢复、烧录与固件升级',
+    summaryEn: 'Improve connection recovery, flashing and firmware updates',
+    changes: [
+      '修复慢电脑后台启动超时、拔插后重连及 GUI / AI 共享控制权恢复。',
+      '在线、脱机烧录自动暂停采集并在结束后恢复，修复共享烧录等待卡住。',
+      '支持的下载器自动升级；旧版提供本地固件下载和按键升级步骤。',
+      '串口助手扩展功能默认折叠，RTT 搜索跳过无效签名。',
+    ],
+    changesEn: [
+      'Fix slow backend startup, reconnect after replug and shared GUI / AI control recovery.',
+      'Pause and restore capture around online/offline flashing; fix stalled shared flash jobs.',
+      'Update supported probes automatically; offer firmware downloads and button instructions for older probes.',
+      'Collapse optional Serial Assistant panels and skip invalid RTT signatures during search.',
+    ],
+  },
+  {
+    version: '0.3.0', date: '2026-10-08',
+    summary: '共享连接、多通道 RTT 与高速采集',
+    summaryEn: 'Shared connections, multichannel RTT and high-speed capture',
+    changes: [
+      'GUI、AI、CLI、MCP 共享连接，支持多下载器独立运行与远程仪表盘。',
+      '配套 V3/V4 新固件支持八通道 RTT，与 SuperWatch 并行采集。',
+      '优化高速采样、波形缩放和调试共存，AI 可按需切换 GUI 展示调试结果。',
+      '修复 Web AXF 加载与多客户端启停，完善 HPM BIN/HEX 烧录。',
+    ],
+    changesEn: [
+      'Share connections across GUI, AI, CLI and MCP, with independent probes and a remote dashboard.',
+      'Companion V3/V4 firmware supports eight RTT channels alongside SuperWatch.',
+      'Improve high-speed sampling, plot zoom and debugger coexistence; AI can present results in the GUI on demand.',
+      'Fix Web AXF loading and shared start/stop; improve HPM BIN/HEX flashing.',
+    ],
+  },
+  {
+    version: '0.2.3', date: '2026-10-03',
+    summary: '优化 SuperWatch，完善烧录与采集稳定性',
+    summaryEn: 'Improve SuperWatch, flashing and capture reliability',
+    changes: [
+      'SuperWatch 支持日志回放、持续采样时写入变量，V4 新增 HPM/JTAG 实时通道（需配套固件）。',
+      '分组即波形区，支持中文别名、加粗、采样点显示和专注视图；优化多关键词与结构体成员搜索。',
+      '修复采集停滞、扇区识别及 nRF54L 在线/脱机烧录问题，新增电源遥测。',
+    ],
+    changesEn: [
+      'Add log replay and writes during capture; V4 adds HPM/JTAG live access with companion firmware.',
+      'One group per plot, aliases, bold traces, sample points and focus view; improve keyword and struct-member search.',
+      'Fix capture stalls, sector detection and nRF54L flashing; add power telemetry.',
+    ],
+  },
+  {
+    version: '0.2.2', date: '2026-09-20',
+    summary: '改善实时采集共享、长变量显示与烧录稳定性',
+    summaryEn: 'Improve shared capture, long variable paths and flashing reliability',
+    changes: [
+      'WebGUI 与桌面版新增浅色、暗黑和跟随系统主题，默认暗黑并自动记住选择；SuperWatch 支持黑底波形与主题同步导出。',
+      'SuperWatch 长变量支持原位横向拖动查看，悬停显示完整路径；窄侧栏数值与操作分行显示。',
+      '同步 AI/API 修改的采集档位，SystemView 可接入外部启动的实时采集，不重复启动设备。',
+      '修复 API 重启采集后的时间轴误丢帧及高吞吐 WebSocket 心跳并发断流；串口页面提前订阅，保留首段输出。',
+      '优化高频采集显示与共享数据流；修复切换芯片后的 SVD 候选选择。',
+      '完善 RTT 搜索边界和窄变量、非对齐读取；相关探针修复需配套固件。',
+      '改善高速在线烧录的复位初始化，修复脱机 IDCODE 日志被误隐藏。',
+      '优化 ARM/HPM 在线烧录校验；Skill 优先复用工程 IDE 下载，其次在线烧录，最后脱机烧录。',
+      '新增 HPM5301 用户 OTP 在线配置与下载后脱机配置；全部固件校验成功后才写用户数据，永久组锁最后执行，需配套 HPMLink 固件。',
+    ],
+    changesEn: [
+      'Default WebGUI and desktop to Dark, retain saved Light/Dark/System preferences, and match SuperWatch plots and PNG export to the theme.',
+      'Drag long variable paths horizontally in place, hover for the full path, and separate values and controls in narrow catalogs.',
+      'Follow AI/API clock changes and attach to externally started SystemView sessions without restarting capture.',
+      'Reset capture timeline epochs, avoid high-throughput WebSocket heartbeat drain failures, and preserve initial serial output.',
+      'Improve high-rate shared streams and SVD selection after changing chips.',
+      'Improve RTT search bounds and narrow/unaligned reads; probe-side fixes require compatible firmware.',
+      'Improve reset initialization during fast online flashing and preserve offline IDCODE logs.',
+      'Optimize ARM/HPM online verification; prefer the project IDE for Skill-driven downloads, then online flashing, then offline flashing.',
+      'Add HPM5301 user OTP configuration online and after offline downloads. Verify all firmware before writing user data, apply permanent group locks last, and require compatible HPMLink firmware.',
+    ],
+  },
+  {
   "version": "0.2.1",
   "date": "2026-09-14",
   "summary": "统一高速采集、外设与选项字节配置，迁移官方更新仓库",

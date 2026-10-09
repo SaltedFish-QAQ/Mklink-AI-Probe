@@ -17,6 +17,10 @@
 
 ## Keil 默认流程
 
+用户表示“Keil 能正常下载”时，优先复用该工程已有的下载器、目标和 Flash 算法配置。
+先停止 GUI/MCP 的采集并释放探针，避免与 IDE 抢占。不要为了使用 MKLink MCP
+而改走脱机下载，也不要要求用户重新选择已经由工程确定的算法。
+
 先从 `.mklink/project_info.json` 或 `python -m mklink project-init` 获取 `uvprojx_path` 和 `target_name`，再定位 `UV4.exe`。默认执行编译后下载：
 
 先按[工作目录约定](work-files.md)确定并创建本次日志目录，将其绝对路径赋给
@@ -47,7 +51,7 @@ IAR 工程优先用 `IarBuild.exe <project.ewp> -build <configuration>` 编译�
 
 在线烧录使用 `/online-flash` 页面或 `/api/online-flash` REST 工作流，不要用原生串口 `python -m mklink flash` 冒充 pyOCD：
 
-1. 启动 `python -m mklink serve --host 127.0.0.1 --port 8765 --project-root <project>`。
+1. 启动 `python -m mklink gui --no-browser --host 127.0.0.1 --port 8765 --project-root <project>`。
 2. `GET /api/online-flash/probes` 选择 MKLink CMSIS-DAP 探针。
 3. `GET /api/online-flash/targets` 确认精确器件。
 4. `POST /api/online-flash/images/inspect` 上传并检查 HEX/BIN；BIN 必须给基址。
@@ -62,6 +66,8 @@ IAR 工程优先用 `IarBuild.exe <project.ewp> -build <configuration>` 编译�
 
 ## FLM 来源
 
+以下是已选定 FLM 路径后的来源顺序，不改变 IDE → pyOCD → 脱机的下载优先级。
+
 自动选择顺序：
 
 1. 发布包内置的精简 Pack 算法；
@@ -71,7 +77,25 @@ IAR 工程优先用 `IarBuild.exe <project.ewp> -build <configuration>` 编译�
 
 自动选择优先使用覆盖固件地址范围且标记为默认的内置算法。只有内置源没有精确器件/地址覆盖时才查询已安装 Pack 和自定义目录。用户显式提供 `--flm` 或在界面选择算法时，显式选择覆盖自动顺序；执行前仍校验文件后缀、范围和摘要。
 
-HPM 型号是固定例外：只使用设备端 HPM ROM API 和 BIN，不发现、下载或加载任何 FLM/Pack。
+HPM 型号是固定例外：只使用设备端 HPM ROM API，不发现、下载或加载任何 FLM/Pack。支持 BIN；新版 V4 固件还支持 HEX，使用文件内绝对地址，由工具检查能力并规范化文件。
+
+## FLM 兼容性
+
+STM32 的一个 FLM 常由同系列多个型号共享，文件名不必包含芯片完整料号。
+精确名称没有命中时，继续核对当前 IDE 工程使用的算法和本地 Pack 的 `.pdsc`
+器件继承/算法映射；已知可用的工程配置优先作为兼容性证据，必要时显式指定 FLM。
+
+执行前核对 Flash 控制器/容量组、起始地址、实际容量、扇区布局、算法 RAM
+工作区以及镜像所有段的范围。算法声明的范围不能代替目标芯片实际容量；仅覆盖
+镜像地址也不足以证明算法兼容。保留真实目标型号，不改成更大容量型号来通过检查。
+
+例如 STM32F103CB 找不到同名 FLM 时，应检查工程或 Pack 是否映射到
+`STM32F10x_128.FLM`，确认布局和 RAM 工作区后复用；不能默认回退到
+`STM32F10x_1024.FLM`。C8 与 CB 不能仅因引脚相同就假定可用容量相同。
+
+多个候选先用上述证据筛选。唯一兼容项可自动显式选定；仍存在实质歧义才请用户
+选择。工具若仍拒绝已确认的映射，记录限制并使用可用的 IDE 路径，不绕过校验。
+这项兼容复用只适用于普通烧录，不扩大选项字节、加锁或解锁的精确型号白名单。
 
 ## 完成信号
 
