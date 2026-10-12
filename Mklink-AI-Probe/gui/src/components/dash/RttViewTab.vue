@@ -37,7 +37,7 @@
       <div class="rtt-address-row">
         <label for="rtt-channels">{{ tr('采集通道', 'Capture channels') }}</label>
         <input id="rtt-channels" v-model="captureChannels" :disabled="effectiveRunning || starting" placeholder="0,1" size="12">
-        <span>{{ tr('逗号分隔 0–7；每个通道均支持日志、终端和曲线，多通道需要新版固件。', 'Comma-separated 0–7; every channel supports logs, terminal and charts. Multiple channels require new firmware.') }}</span>
+        <span>{{ tr('逗号分隔 0–7；每个通道均支持收发、终端和曲线，多通道需要新版固件。', 'Comma-separated 0–7; every channel supports traffic, terminal and charts. Multiple channels require new firmware.') }}</span>
         <span v-if="multiplex">{{ tr('多路复用 · 可与 SuperWatch 并行', 'Multiplex · concurrent with SuperWatch') }}</span>
       </div>
       <ControlToolbar
@@ -56,6 +56,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { Search } from '@lucide/vue'
+import { CAPTURE_START_TIMEOUT_MS } from '../../lib/captureStartup'
 import { useDashboard } from '../../composables/useDashboard'
 import { useMklinkApi } from '../../composables/useMklinkApi'
 import { useDashboardSetup } from '../../composables/useDashboardSetup'
@@ -221,7 +222,7 @@ async function pollStatus(): Promise<void> {
   if (!disposed) statusTimer = setTimeout(pollStatus, 1_000)
 }
 
-async function waitForRttReady(timeoutMs = 11_000): Promise<boolean> {
+async function waitForRttReady(timeoutMs = CAPTURE_START_TIMEOUT_MS): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (!disposed && Date.now() < deadline) {
     const status = await refreshStatus()
@@ -232,7 +233,7 @@ async function waitForRttReady(timeoutMs = 11_000): Promise<boolean> {
     await new Promise(resolve => setTimeout(resolve, 100))
   }
   if (!disposed) {
-    runtimeError.value = tr('RTT 启动超时，请检查地址后重试', 'RTT startup timed out. Check the address and retry.')
+    runtimeError.value = tr('RTT 后台准备超时；请查看后台错误和连接状态，地址不一定有误', 'RTT backend preparation timed out. Check backend errors and connection status; the address may be valid.')
     const stopped = await stopTimedOutRtt()
     statusRunning.value = false
     downBuffers.value = []
@@ -325,8 +326,9 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.rtt-channel-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; flex: 1; min-height: 0; overflow: auto; padding-top: 8px; }
-.rtt-channel-grid.multiple { grid-template-columns: repeat(auto-fit, minmax(min(480px, 100%), 1fr)); align-content: start; }
+.rtt-channel-grid { display: flex; flex-wrap: wrap; align-content: start; align-items: flex-start; gap: 12px; flex: 1; min-height: 0; overflow: auto; padding-top: 8px; }
+.rtt-channel-grid.multiple > :deep(.rtt-channel-panel) { width: calc(50% - 6px); }
+@media (max-width: 1000px) { .rtt-channel-grid.multiple > :deep(.rtt-channel-panel) { width: 100%; } }
 .rtt-view-tab { display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; }
 .alert-warn { color: var(--warn); padding: 8px; border: 1px solid var(--warn); border-radius: 4px; }
 .rtt-address-row { display: grid; grid-template-columns: auto minmax(180px, 320px) auto minmax(0, 1fr); align-items: center; gap: 10px; min-height: 38px; padding: 2px 0 7px; border-bottom: 1px solid var(--border-subtle); }

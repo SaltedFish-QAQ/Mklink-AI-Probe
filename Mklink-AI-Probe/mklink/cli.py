@@ -1756,15 +1756,18 @@ def _cli_serial_dispatch(args):
 def _cli_gui(args):
     """Hand the selected backend to a GUI without extending its idle policy."""
     import webbrowser
-    from mklink.runtime import browser_url, ensure_runtime, handoff_gui
+    from mklink.runtime import browser_url, ensure_runtime, handoff_gui, connect_gui_target
     if args.host != "127.0.0.1":
         raise SystemExit("Shared GUI binds only 127.0.0.1")
-    info = ensure_runtime(project_root=args.project_root, port=args.port, probe=args.probe,
-                          device_port=args.device_port, allow_lobby=True)
+    selected_probe = args.probe
+    if args.axf and not (selected_probe or args.device_port):
+        from mklink.probes import select_probe
+        selected_probe = select_probe()['probe_id']
+    info = ensure_runtime(project_root=args.project_root, port=args.port, probe=selected_probe,
+                          device_port=args.device_port, allow_lobby=True, new_window=True)
     def prepare(client):
         if args.device_port or args.axf:
-            client.connect(project_root=args.project_root if args.project_root != "." else None,
-                           port=args.device_port, axf=args.axf)
+            connect_gui_target(info, {'axf': args.axf})
         print(f"[MKLink] Shared CDC runtime: http://127.0.0.1:{info['port']}")
         print("[MKLink] Waiting up to 60 seconds for a GUI window. Ctrl+C cancels this launcher.")
         print("[MKLink] After handoff, the runtime exits after about 5 seconds without clients or active jobs.")
@@ -1840,7 +1843,7 @@ def _cli_runtime(args):
     from mklink.runtime import RuntimeClient, RuntimeErrorResponse, ensure_runtime, request, running_runtimes, selected_runtime, serve_runtime
     try:
         if args.runtime_command == "serve":
-            serve_runtime(project_root=args.project_root, port=args.port, probe_id=args.probe_id)
+            serve_runtime(project_root=args.project_root, port=args.port, probe_id=args.probe_id, runtime_id=args.runtime_id)
             return
         if args.runtime_command == "start":
             info = ensure_runtime(project_root=args.project_root, port=args.port, probe=args.probe, device_port=args.device_port)
@@ -2647,6 +2650,8 @@ def main():
         "mcp",
         help="启动 MCP (Model Context Protocol) server（stdio，供 Claude Code / 其他 MCP client 调用）",
     )
+    mcp_config_parser = subparsers.add_parser('mcp-config', help='输出本机 MCP 配置：固定解释器和可写缓存目录')
+    mcp_config_parser.add_argument('--cache-dir', required=True, help='当前 AI 账户可写的绝对缓存目录')
 
     runtime_parser = subparsers.add_parser("runtime", help="管理 0.3 共享 CDC 后台及调用 GUI 能力")
     runtime_sub = runtime_parser.add_subparsers(dest="runtime_command", required=True)
@@ -2657,6 +2662,7 @@ def main():
         entry.add_argument("--probe", default=None)
         entry.add_argument("--device-port", default=None)
         entry.add_argument("--probe-id", default="lobby", help=argparse.SUPPRESS)
+        entry.add_argument("--runtime-id", default=None, help=argparse.SUPPRESS)
     runtime_sub.add_parser("status")
     runtime_control = runtime_sub.add_parser('control', help='查询或恢复指定后台，不连接硬件')
     runtime_control.add_argument('action', choices=['status', 'detach-client', 'stop-acquisition', 'release-device', 'stop-backend'])
@@ -2857,6 +2863,13 @@ def main():
         _cli_web_entry(args)
     elif args.command == "mcp":
         _cli_mcp(args)
+    elif args.command == 'mcp-config':
+        import json
+        from mklink.mcp_config import configuration
+        try:
+            print(json.dumps(configuration(args.cache_dir), ensure_ascii=False, indent=2))
+        except ValueError as exc:
+            parser.error(str(exc))
     elif args.command == "security":
         return _cli_security(args)
     else:

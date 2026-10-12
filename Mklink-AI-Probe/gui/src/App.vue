@@ -82,7 +82,7 @@
       <DashboardView v-if="initialBackendReady && dashboardVisited" v-show="currentTab === 'dashboard'" />
       <router-view v-if="initialBackendReady" v-slot="{ Component, route: viewRoute }">
         <!-- Override the shared v-if branch key so cached flash pages stay distinct. -->
-        <KeepAlive include="OnlineFlashView,OfflineFlashView">
+        <KeepAlive :key="deviceStatus.device_generation || 0" include="OnlineFlashView,OfflineFlashView">
           <component :is="Component" v-if="viewRoute.name !== 'dashboard'" :key="viewRoute.path" />
         </KeepAlive>
       </router-view>
@@ -93,6 +93,7 @@
         <div>
           <strong>{{ recoveryTitle }}</strong>
           <p v-if="!isTauri">{{ recoveryHint }}</p>
+          <p v-if="isTauri && backendStartupError" data-testid="backend-startup-error">{{ backendStartupError }}</p>
         </div>
         <button v-if="isTauri" data-testid="backend-restart" @click="restart">{{ tr('重启服务', 'Restart Service') }}</button>
         <button v-else data-testid="backend-recheck" @click="refreshHealth">{{ tr('重新检查', 'Check Again') }}</button>
@@ -132,8 +133,8 @@ const router = useRouter()
 // Keep the dashboard attached (hidden) rather than detaching it with KeepAlive.
 const DashboardView = defineAsyncComponent(() => import('./views/DashboardView.vue'))
 const route = useRoute()
-const { startStatusPolling, stopStatusPolling } = useMklinkApi()
-const { backendState, sharedRuntime, authenticationRequired, startHealthPolling, stopHealthPolling, restart, refreshHealth, isTauri } = useBackendHealth()
+const { startStatusPolling, stopStatusPolling, deviceStatus } = useMklinkApi()
+const { backendState, sharedRuntime, authenticationRequired, backendStartupError, startHealthPolling, stopHealthPolling, restart, refreshHealth, isTauri } = useBackendHealth()
 const recoveryTitle = computed(() => authenticationRequired.value
   ? tr('当前页面授权已失效', 'This page is no longer authorized')
   : tr('无法连接本地服务', 'Cannot reach the local service'))

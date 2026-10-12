@@ -23,6 +23,8 @@ import struct
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
+from functools import wraps
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +59,32 @@ class DeviceNotConnectedError(DeviceError):
 
 class _InvalidRTTControlBlock(DeviceError):
     """Readable RAM that isn't a structurally valid RTT control block."""
+
+
+_ram_validation_snapshot = ContextVar('ram_validation_snapshot', default=None)
+
+
+def _with_ram_snapshot(operation):
+    """Resolve trusted memory once per operation, never across starts/threads."""
+    @wraps(operation)
+    def wrapped(self, *args, **kwargs):
+        snapshot = _ram_validation_snapshot.get()
+        if snapshot is not None and snapshot[0] is self:
+            return operation(self, *args, **kwargs)
+        started = time.monotonic()
+        ranges = self._target_writable_ram_ranges()
+        ram_ms = (time.monotonic()-started)*1000
+        token = _ram_validation_snapshot.set((self, ranges))
+        try:
+            result = operation(self, *args, **kwargs)
+            if operation.__name__ in ('rtt_start', 'systemview_start') and isinstance(result, dict):
+                result.setdefault('startup_timings_ms', {}).update(
+                    trusted_ram=round(ram_ms, 2), total=round((time.monotonic()-started)*1000, 2),
+                )
+            return result
+        finally:
+            _ram_validation_snapshot.reset(token)
+    return wrapped
 
 
 _RT_THREAD_NAME_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_.-]*")
@@ -307,6 +335,7 @@ class Device:
         self._symbol_lock = threading.RLock()
         self._axf_error = None  # reason ELF/DWARF loading was skipped
         self._connected = False
+        self.clock_warning = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -345,15 +374,25 @@ class Device:
         self._port = candidate
         self._connected = True
 
-        from mklink.flash import MKLinkFlash
+        from mklink.flash import MKLinkFlash, FlashError
         self._flash = MKLinkFlash(self._bridge)
+        self.clock_warning = None
 
         # The configuration page's raw SWD clock also applies to deferred GUI
         # connections. Previously it was only consumed by flash(), so a new
         # connection silently inherited whatever clock the probe last used.
-        if config.get("swd_clock"):
+        if config.get("swd_clock") or config.get("debug_speed"):
             try:
-                self._flash.set_swd_clock(config["swd_clock"])
+                from mklink.debug_speed import profile_clock
+                clock = config.get("swd_clock") or profile_clock(config["debug_speed"])
+                self._flash.set_swd_clock(clock)
+            except (FlashError, ValueError) as error:
+                # The USB command session is independent of optional saved
+                # clock settings. Keep it available for configuration/retry.
+                if not self.connected:
+                    self.close()
+                    raise
+                self.clock_warning = str(error)
             except Exception:
                 self.close()
                 raise
@@ -377,9 +416,14 @@ class Device:
         if self._axf:
             self._load_dwarf_info()
 
-        if self._initialize_target_now and (config.get("debug_speed") or detected_idcode == 0x1000563D):
+        if detected_idcode == 0x1000563D and not (config.get("swd_clock") or config.get("debug_speed")):
             try:
-                self.set_debug_speed(config.get("debug_speed", "medium"))
+                self.set_debug_speed("medium")
+            except ValueError as error:
+                if not self.connected:
+                    self.close()
+                    raise
+                self.clock_warning = str(error)
             except Exception:
                 self.close()
                 raise
@@ -387,7 +431,20 @@ class Device:
     def set_debug_speed(self, profile: str) -> dict:
         """Apply a named 4/10/20/30 MHz profile to an idle connection."""
         from mklink.debug_speed import apply_profile
-        return apply_profile(self, profile)
+        try:
+            result = apply_profile(self, profile)
+        except ValueError as error:
+            self.clock_warning = str(error)
+            raise
+        self.clock_warning = None
+        return result
+
+    @property
+    def clock_hz(self) -> int | None:
+        """Last clock acknowledged by the probe, never the saved request."""
+        context = getattr(self._bridge, '_ctx', None)
+        hz = getattr(context, 'swd_clock_hz', None)
+        return hz if self.connected and type(hz) is int and hz > 0 else None
 
     def close(self) -> None:
         if self._rtt_session and self._rtt_session._running:
@@ -1288,6 +1345,9 @@ class Device:
         unimplemented address holes, so treating it as writable RAM can make a
         malformed RTT descriptor unsafe.
         """
+        snapshot = _ram_validation_snapshot.get()
+        if snapshot is not None and snapshot[0] is self:
+            return snapshot[1]
         ranges: list[tuple[int, int]] = []
 
         catalog = self.symbol_catalog
@@ -1427,6 +1487,7 @@ class Device:
         return min(_RTT_DEFAULT_SEARCH_SIZE,
                    limit - address - len(_RTT_SIGNATURE) + 1)
 
+    @_with_ram_snapshot
     def validate_rtt_stream_request(
         self,
         addr: str | int,
@@ -1449,6 +1510,7 @@ class Device:
             purpose = "RTT control block"
         self._require_target_ram_range(address, span, purpose=purpose)
 
+    @_with_ram_snapshot
     def _find_rtt_control_block(
         self, start_address: int, search_size: int,
     ) -> int | None:
@@ -1460,6 +1522,32 @@ class Device:
         self._require_target_ram_range(
             start_address, scan_span, purpose="RTT scan window",
         )
+        rejected = []
+
+        def validate(candidate):
+            if not self._target_ram_contains(candidate, 24):
+                rejected.append(f"0x{candidate:08X}: header is outside known target writable RAM")
+                return False
+            try:
+                info = self._read_rtt_control_block(candidate)
+            except _InvalidRTTControlBlock as exc:
+                if 'invalid signature' not in str(exc):
+                    rejected.append(f"0x{candidate:08X}: {exc}")
+                return False
+            if any(buffer['active'] for buffer in info['up_buffers']):
+                return True
+            reasons = '; '.join(
+                f"UpBuffer {item['channel']}: {item['validation_error']}"
+                for item in info['up_buffers']
+            )
+            rejected.append(f"0x{candidate:08X}: {reasons}")
+            return False
+
+        # Symbol/manual addresses normally already point at the control block.
+        # Validate it before reading the rest of the search window.
+        checked_start = bool(search_size) and self._target_ram_contains(start_address, 24)
+        if checked_start and validate(start_address):
+            return start_address
         for offset in range(0, search_size, _RTT_SCAN_CHUNK):
             candidate_span = min(_RTT_SCAN_CHUNK, search_size - offset)
             raw = self.read_memory(
@@ -1473,16 +1561,16 @@ class Device:
             for relative in range(0, max_candidate, 4):
                 if raw[relative:relative + len(_RTT_SIGNATURE)] == _RTT_SIGNATURE:
                     candidate = start_address + offset + relative
-                    if not self._target_ram_contains(candidate, 24):
+                    if candidate == start_address and checked_start:
                         continue
-                    try:
-                        info = self._read_rtt_control_block(candidate)
-                    except _InvalidRTTControlBlock:
-                        continue
-                    # An empty/uninitialized table can contain the signature too.
-                    # Transport errors must propagate instead of triggering more I/O.
-                    if any(buffer['active'] for buffer in info['up_buffers']):
+                    if validate(candidate):
                         return candidate
+        if rejected:
+            raise DeviceError(
+                "RTT signature found but control block validation failed: "
+                + '; '.join(rejected[:4])
+                + ". Check the loaded ELF/MCU RAM map and target initialization."
+            )
         return None
 
     def _parse_rtt_descriptor(
@@ -1526,6 +1614,7 @@ class Device:
             "validation_error": "; ".join(problems),
         }
 
+    @_with_ram_snapshot
     def _read_rtt_control_block(self, control_block_addr: int) -> dict[str, Any]:
         """Read and validate the standard SEGGER RTT header/descriptors."""
         if control_block_addr % 4:
@@ -1641,6 +1730,7 @@ class Device:
                 'This firmware supports one RTT channel (0, 1 or 2); select one channel or update the probe firmware.'
             )
 
+    @_with_ram_snapshot
     def rtt_start(
         self,
         addr: str | int | None = None,
@@ -1668,10 +1758,13 @@ class Device:
             source_path=self._axf,
         )
         self.validate_rtt_channels(channel, channels)
+        stage_started = time.monotonic()
+        startup_timings = {}
         multiplex = self._bridge.supports_multiplex() is True if hasattr(self._bridge, 'supports_multiplex') else False
         selected = list(channels) if channels is not None else [channel]
         if multiplex:
             self._bridge.enable_multiplex()
+        startup_timings['transport_prepare'] = round((time.monotonic()-stage_started)*1000, 2)
         if self._rtt_session and self._rtt_session._running:
             self._rtt_session.stop()
         self._rtt_session = None
@@ -1679,6 +1772,7 @@ class Device:
         self._rtt_write_guard_tail = b""
 
         requested_addr = int(addr, 0)
+        stage_started = time.monotonic()
         self.validate_rtt_stream_request(
             addr, search_size=search_size, mode=mode,
         )
@@ -1696,6 +1790,7 @@ class Device:
             raise DeviceError('RTT up descriptor count exceeds legacy firmware limit of 3')
         for selected_channel in selected:
             self._validate_rtt_channel(control_info, selected_channel)
+        startup_timings['control_block_validation'] = round((time.monotonic()-stage_started)*1000, 2)
         session_addr = f"0x{control_block_addr:08X}"
         session_search_size = 4 if mode == 0 else search_size
 
@@ -1707,6 +1802,7 @@ class Device:
             session = RTTSession(self._bridge, channel=channel)
         self._rtt_session = session
         try:
+            stage_started = time.monotonic()
             result = session.start(
                 session_addr,
                 search_size=session_search_size,
@@ -1750,6 +1846,8 @@ class Device:
             result["down_buffer_source"] = "target-control-block"
             self._rtt_control_block_info = control_info
             self._rtt_write_guard_tail = b""
+            startup_timings['probe_start'] = round((time.monotonic()-stage_started)*1000, 2)
+            result['startup_timings_ms'] = startup_timings
             return result
         except Exception:
             try:
@@ -1864,6 +1962,7 @@ class Device:
     # ------------------------------------------------------------------
     # SystemView（RTOS 跟踪：RTT 通道 1 二进制流 → SEGGER 事件解码）
     # ------------------------------------------------------------------
+    @_with_ram_snapshot
     def systemview_start(
         self,
         addr: str | int | None = None,

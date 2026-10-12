@@ -12,6 +12,70 @@ from test_remote_api import _connected_symbol_device
 from test_shared_runtime import runtime, attach
 
 
+@pytest.mark.parametrize('status', [None, 500, 502, 503, 504])
+def test_transient_heartbeat_failure_keeps_existing_lease(monkeypatch, runtime, status):
+    client, control, calls, _, _ = runtime
+    session = attach(client)
+    renewed = []
+    class Stop:
+        def wait(self, seconds):
+            return bool(renewed)
+    attempts = []
+    def request(info, method, path, payload, **options):
+        assert method == 'POST' and path == '/_runtime/heartbeat'
+        assert payload == {'session_id': session}
+        assert options['timeout'] < 4  # Leave room to retry inside the five-second lease.
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise transport.RuntimeErrorResponse('temporary failure', status_code=status)
+        response = client.post(path, json=payload)
+        assert response.status_code == 200
+        renewed.append(session)
+        return response.json()
+    monkeypatch.setattr(transport, 'request', request)
+    transport.RuntimeClient()._renew(Stop(), session, control.info)
+    assert len(attempts) == 2 and renewed == [session]
+    assert session in control.sessions and calls == []
+
+
+@pytest.mark.parametrize('status,expected', [(None, 3), (503, 3), (401, 1), (403, 1), (409, 1), (422, 1)])
+def test_heartbeat_failure_is_bounded_and_never_reattaches(monkeypatch, status, expected):
+    attempts = []
+    class Stop:
+        def wait(self, seconds):
+            assert len(attempts) <= 3
+            return False
+    def request(info, method, path, payload, **options):
+        attempts.append(path)
+        assert path == '/_runtime/heartbeat' and payload == {'session_id': 'old'}
+        raise transport.RuntimeErrorResponse('failed', status_code=status)
+    monkeypatch.setattr(transport, 'request', request)
+    transport.RuntimeClient()._renew(Stop(), 'old', {'port': 8765})
+    assert len(attempts) == expected
+
+
+def test_expired_lease_after_transient_heartbeat_failure_is_not_resurrected(monkeypatch, runtime):
+    client, control, calls, _, _ = runtime
+    session = attach(client)
+    attempts = []
+    class Stop:
+        def wait(self, seconds):
+            assert len(attempts) < 3
+            return False
+    def request(info, method, path, payload, **options):
+        attempts.append(path)
+        assert path == '/_runtime/heartbeat'
+        if len(attempts) == 1:
+            control.sessions[session].expires = 0
+            raise transport.RuntimeErrorResponse('response timed out')
+        response = client.post(path, json=payload)
+        assert response.status_code == 409
+        raise transport.RuntimeErrorResponse(response.text, status_code=409)
+    monkeypatch.setattr(transport, 'request', request)
+    transport.RuntimeClient()._renew(Stop(), session, control.info)
+    assert len(attempts) == 2 and session not in control.sessions and not calls
+
+
 @pytest.mark.parametrize('failure', ['offline', 'replaced'])
 def test_explicit_connect_rediscovers_bound_runtime_without_replaying_work(monkeypatch, failure):
     old = dict(port=8765, token='old', instance_id='old', probe_id='usb-' + '1' * 24)
@@ -69,15 +133,12 @@ def test_disconnected_target_stops_renewing_only_target_sessions(runtime, scope,
     assert (session in control.sessions) == (scope == 'uart')
 
 
-def test_live_shared_disconnect_exposes_owners_without_releasing_device(runtime):
+def test_explicit_disconnect_is_admitted_with_shared_clients(runtime):
     client, control, calls, _, _ = runtime
-    session = attach(client)
+    attach(client)
     result = client.post('/api/device/disconnect')
-    assert result.status_code == 409
-    detail = result.json()['detail']
-    assert detail['reason'] == 'shared_clients_attached'
-    assert detail['clients'][0]['id'] == control.sessions[session].public_id
-    assert session not in str(detail) and not calls
+    assert result.status_code == 200 and calls == ['disconnect']
+    # The real device handler's retirement is covered by test_runtime_switch.
 
 
 def test_temporary_cdc_release_during_admitted_operation_does_not_evict_client(runtime):

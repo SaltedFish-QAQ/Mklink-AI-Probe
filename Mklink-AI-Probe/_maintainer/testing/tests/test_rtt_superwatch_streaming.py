@@ -1100,6 +1100,33 @@ def test_superwatch_subscribe_replays_cached_metadata_without_waiting_for_read(m
     asyncio.run(scenario())
 
 
+def test_superwatch_publishes_original_failure_during_cleanup(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    class FailedSession:
+        stats = {}
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+        def read_frames(self, **kwargs): raise RuntimeError('original acquisition timeout')
+        def stop(self):
+            entered.set()
+            assert release.wait(2)
+            raise RuntimeError('secondary stop timeout')
+
+    monkeypatch.setattr('mklink.dump_memory.DumpMemoryStreamSession', FailedSession)
+    manager = SuperWatchStreamManager()
+    manager._runtime = _MutableWatchRuntime()
+    manager.start(SimpleNamespace(_bridge=_SuperWatchDumpBridge()))
+    try:
+        assert entered.wait(1)
+        status = manager.get_status()
+        assert status['error'] == 'original acquisition timeout'
+        assert manager._thread.is_alive() and manager.running
+    finally:
+        release.set()
+        manager.stop()
+    assert manager.get_status()['error'] == 'original acquisition timeout'
+
+
 def test_superwatch_layout_change_does_not_wait_for_read_and_discards_stale_cycle(monkeypatch):
     hub = _RecordingHub()
     manager = SuperWatchStreamManager(stream_hub=hub, batch_samples=1)
@@ -1360,6 +1387,52 @@ def test_superwatch_uses_dump_stream_and_reports_protocol_integrity():
     assert b"cmd.dump_memory(0x20000000, 4, 0)\n" not in bridge.writes
 
 
+def test_superwatch_mux_transient_read_failure_keeps_capture_and_connection():
+    from test_mux import peer
+    from mklink.mux import packet
+    transport, commands = peer()
+    transport.handshake()
+    request = transport.request
+    def start_with_samples(op, *args, **kwargs):
+        result = request(op, *args, **kwargs)
+        if op == 0x32:
+            for seq, payload in enumerate([
+                bytes([0, 9, 1, 4]) + struct.pack('<If', 100, 1.5),
+                struct.pack('<BBI', 0, 5, 200),
+                bytes([0, 9, 1, 4]) + struct.pack('<If', 400, 2.5),
+            ], 1):
+                transport.feed(packet(0x41, 17, seq, payload))
+        return result
+    transport.request = start_with_samples
+    item = SimpleNamespace(name='value', type_name='float', size=4, address=0x20000000,
+                           source='ram', enum_values=None, metadata={})
+    bridge = SimpleNamespace(
+        supports_multiplex=lambda: True, enable_multiplex=lambda: transport,
+        _enter_stream=Mock(), _write_raw=Mock(), drain_stream_bytes=Mock(), _exit_stream=Mock(),
+    )
+    device = SimpleNamespace(_bridge=bridge, connected=True)
+    hub = StreamHub(max_batches_per_client=4)
+    manager = SuperWatchStreamManager(stream_hub=hub, batch_samples=1)
+    manager._runtime = SimpleNamespace(items=[item], blocks=[
+        SimpleNamespace(address=0x20000000, size=4, items=[item])])
+    manager.start(device)
+    try:
+        deadline = time.monotonic() + 2
+        while manager.get_status()['read_cycles'] < 2 and time.monotonic() < deadline:
+            time.sleep(.001)
+        status = manager.get_status()
+        assert status['state'] == 'running' and status['error'] is None
+        assert status['read_cycles'] == 2 and status['read_errors'] == 1
+        assert status['stream_integrity']['firmware_read_errors'] == 1
+        assert hub.stats().produced_items == 2
+        assert device.connected and transport.watch_running
+        assert [op for op, _ in commands].count(0x32) == 1
+        assert not any(op == 0x31 for op, _ in commands)
+    finally:
+        manager.stop()
+    assert [op for op, _ in commands].count(0x31) == 1
+
+
 def test_superwatch_rejects_bridge_without_dump_stream_instead_of_read_ram_fallback():
     manager = SuperWatchStreamManager()
     manager._runtime = SuperWatchRuntime(items=[
@@ -1444,22 +1517,14 @@ def test_superwatch_prepare_rebinds_existing_runtime_to_reconnected_device(
     manager._device = old_device
 
     manager.prepare(new_device)
-    monkeypatch.setattr(
-        manager,
-        "_readback_once",
-        lambda address, size: new_operations.append(("readback", address, size))
-        or struct.pack("<f", 1.5),
-        raising=False,
-    )
 
     result = manager.write_symbol("gain", generation=1, value=1.5)
 
     assert old_operations == []
     assert new_operations == [
         ("write", 0x20000020, struct.pack("<f", 1.5)),
-        ("readback", 0x20000020, 4),
     ]
-    assert result["verified"] is True
+    assert result["acknowledged"] and result["verified"] is False
 
 
 def test_superwatch_prepare_rebinds_selected_items_to_new_device_catalog(tmp_path):
@@ -1514,15 +1579,6 @@ def test_superwatch_prepare_rebinds_selected_items_to_new_device_catalog(tmp_pat
     assert [(block.address, block.size) for block in manager._runtime.blocks] == [
         (0x20000040, 4),
     ]
-
-
-def test_superwatch_readback_uses_command_mode_after_dump_stream_stops():
-    manager = SuperWatchStreamManager()
-    device = SimpleNamespace(read_memory=Mock(return_value=b"\x00"))
-    manager._device = device
-
-    assert manager._readback_once(0x20000020, 1) == b"\x00"
-    device.read_memory.assert_called_once_with(0x20000020, 1)
 
 
 def test_superwatch_adds_catalog_array_leaves_and_merges_contiguous_reads(tmp_path):

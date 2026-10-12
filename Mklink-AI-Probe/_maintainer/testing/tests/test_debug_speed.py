@@ -8,7 +8,7 @@ from mklink.debug_speed import apply_profile, profile_clock
 
 def device(ident=0x1000563D, response='JTAG profile=20000000 scans=1', state=DeviceState.READY):
     return SimpleNamespace(_require_connected=Mock(), state=state, idcode=ident,
-        _bridge=SimpleNamespace(state=state, idcode=ident, send_command=Mock(return_value=response), _ctx=SimpleNamespace(swd_clock_hz=0)))
+        _bridge=SimpleNamespace(state=state, idcode=ident, send_command=Mock(side_effect=lambda cmd: "set clock 1000000" if cmd == "cmd.set_swd_clock(1000000)" else response), _ctx=SimpleNamespace(swd_clock_hz=0)))
 
 
 @pytest.mark.parametrize('name,hz', [('low',4000000),('medium',10000000),('high',20000000),('ultra',30000000)])
@@ -26,6 +26,23 @@ def test_old_firmware_restores_conservative_clock():
     with pytest.raises(ValueError,match='restored 1 MHz'): apply_profile(d,'high')
     assert d._bridge._ctx.swd_clock_hz==1000000
     assert d._bridge.send_command.call_args.args==('cmd.set_swd_clock(1000000)',)
+
+
+def test_deferred_connection_can_confirm_jtag_before_target_id_is_known():
+    d = device(ident=0, response='set clock 20000000\nJTAG profile=20000000')
+    result = apply_profile(d, 'high')
+    assert result['profile_confirmed'] and result['interface'] == 'JTAG'
+    assert d._bridge._ctx.swd_clock_hz == 20000000
+
+
+def test_unconfirmed_fallback_is_not_reported_as_a_safe_clock():
+    from mklink.debug_speed import ClockProfileUnavailable
+    d = device(response='unsupported')
+    d._bridge.send_command.side_effect = ['unsupported', 'target busy']
+    with pytest.raises(ValueError, match='fallback clock') as failure:
+        apply_profile(d, 'high')
+    assert not isinstance(failure.value, ClockProfileUnavailable)
+    assert d._bridge._ctx.swd_clock_hz == 0
 
 
 @pytest.mark.parametrize('profile,hz', [('low',4000000),('medium',10000000),('high',20000000),('ultra',30000000)])
@@ -49,10 +66,39 @@ def test_legacy_swd_remains_explicitly_unconfirmed():
     assert not apply_profile(d,'medium')['profile_confirmed']
 
 
+@pytest.mark.parametrize('profile,hz', [('low', 4000000), ('medium', 10000000), ('high', 20000000), ('ultra', 30000000)])
+@pytest.mark.parametrize('ident', [0, 0xffffffff, 0x1BA01477, 0x1000563D])
+def test_probe_clock_setting_does_not_require_target_or_profile_ack(profile, hz, ident):
+    d = device(ident=ident, response=(f'set clock {hz}\n'
+        f'SWD requested={hz} transfers=10 wait=0 fault=0 error=0 invalid=10 exhausted=0'))
+    result = apply_profile(d, profile)
+    assert result['clock_hz'] == hz and not result['profile_confirmed']
+    assert 'target timing not verified' in result['qualification']
+    assert d._bridge._ctx.swd_clock_hz == hz
+    d._bridge.send_command.assert_called_once_with(f'cmd.set_swd_clock({hz})')
+
+
+def test_device_reports_fallback_clock_and_clears_warning_after_success():
+    from mklink.device import Device
+    from mklink.debug_speed import ClockProfileUnavailable
+    dev = Device()
+    dev._connected = True
+    dev._bridge = device(ident=0x1BA01477, response='SWD profile=0')._bridge
+    with pytest.raises(ClockProfileUnavailable):
+        dev.set_debug_speed('high')
+    assert dev.clock_hz == 1_000_000
+    assert 'restored 1 MHz' in dev.clock_warning
+    dev._bridge.send_command.side_effect = lambda cmd: 'set clock 20000000\nSWD profile=20000000'
+    dev.set_debug_speed('high')
+    assert dev.clock_hz == 20_000_000 and dev.clock_warning is None
+    dev._bridge._ctx.swd_clock_hz = 0
+    assert dev.clock_hz is None
+
+
 @pytest.mark.parametrize('profile', ['high', 'ultra'])
 @pytest.mark.parametrize('ident', [0x1BA01477, 0x12345678])
-def test_other_targets_high_is_not_silently_mislabeled(profile,ident):
-    d=device(ident=ident)
+def test_explicit_profile_mismatch_is_not_silently_mislabeled(profile,ident):
+    d=device(ident=ident, response='SWD profile=0')
     with pytest.raises(ValueError,match='restored 1 MHz'): apply_profile(d,profile)
     assert d._bridge._ctx.swd_clock_hz == 1000000
     assert d._bridge.send_command.call_args.args == ('cmd.set_swd_clock(1000000)',)
@@ -65,8 +111,8 @@ def test_live_stream_is_not_interrupted_by_raw_command(profile):
     d._bridge.send_command.assert_not_called()
 
 
-@pytest.mark.parametrize('response', ['set clock 30000000', 'JTAG profile=0', 'JTAG profile=20000000'])
-def test_ultra_requires_exact_kernel_acknowledgement(response):
+@pytest.mark.parametrize('response', ['cmd.set_swd_clock(30000000)\n0', 'SWD requested=30000000', 'set clock 300000000', 'set clock 30000000\n-1', 'JTAG profile=0', 'JTAG profile=20000000'])
+def test_ultra_rejects_missing_setting_ack_or_explicit_failure(response):
     d=device(response=response)
     with pytest.raises(ValueError,match='restored 1 MHz'): apply_profile(d,'ultra')
     assert d._bridge._ctx.swd_clock_hz == 1000000

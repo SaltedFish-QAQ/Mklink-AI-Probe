@@ -4,6 +4,10 @@ from __future__ import annotations
 PROFILES = {"low": 4_000_000, "medium": 10_000_000, "high": 20_000_000, "ultra": 30_000_000}
 
 
+class ClockProfileUnavailable(ValueError):
+    """Requested kernel is unavailable, but 1 MHz was explicitly acknowledged."""
+
+
 def validate_clock_hz(hz: int) -> int:
     """Keep legacy clocks up to 10 MHz and the two calibrated high kernels."""
     if type(hz) is not int or not (1 <= hz <= 10_000_000 or hz in (20_000_000, 30_000_000)):
@@ -29,25 +33,30 @@ def apply_bridge_profile(bridge, profile: str) -> dict:
     hz = profile_clock(profile)
     if bridge.state != DeviceState.READY:
         raise ValueError("Stop the active stream before changing debug speed")
-    # High-speed kernels require a supported debug interface and an exact
-    # firmware acknowledgement. This shared ID identifies neither the exact
-    # HPM part nor the electrical qualification of the connected board.
-    hpm = bridge.idcode == 0x1000563D
-    # New SWD firmware exposes the same four profiles. Require its exact
-    # acknowledgement below; old firmware must never be labelled 20/30 MHz.
+    # Clock configuration belongs to the probe, not the attached MCU. V3 may
+    # omit the optional profile line while its target scanner has no IDCODE.
+    # Accept its exact setting acknowledgement for every supported clock;
+    # retain profile_confirmed separately from the accepted setting.
+    bridge._ctx.swd_clock_hz = 0
     response = bridge.send_command(f"cmd.set_swd_clock({hz})")
-    confirmed = False
-    interface = "JTAG" if hpm else "SWD"
-    match = re.search(rf"{interface} profile=(\d+)\b", response)
-    confirmed = bool(match and int(match.group(1)) == hz)
-    legacy = match is None and profile in ("low", "medium") and f"set clock {hz}" in response
-    if not confirmed and not legacy:
-        # The command completed but this firmware lacks the exact timing
-        # kernel. Restore a conservative clock, never label fallback as high.
-        bridge.send_command("cmd.set_swd_clock(1000000)")
+    lines = response.splitlines() if isinstance(response, str) else []
+    match = re.search(r"(?m)^(SWD|JTAG) profile=(\d+)\b", response if isinstance(response, str) else "")
+    interface = match.group(1) if match else "unknown"
+    rejected = any(line.strip() == '-1' or line.strip().lower().startswith('error') for line in lines)
+    confirmed = bool(match and int(match.group(2)) == hz and not rejected)
+    accepted = match is None and not rejected and any(line.strip() == f"set clock {hz}" for line in lines)
+    if not confirmed and not accepted:
+        # An explicit mismatch/rejection or missing setting ACK is still a
+        # failure. Never treat the command echo or diagnostic counters as ACK.
+        fallback = bridge.send_command("cmd.set_swd_clock(1000000)")
+        if not isinstance(fallback, str) or not any(
+            line.strip() == "set clock 1000000" for line in fallback.splitlines()
+        ):
+            bridge._ctx.swd_clock_hz = 0
+            raise ValueError(f"Probe firmware did not confirm {interface} profile or fallback clock")
         bridge._ctx.swd_clock_hz = 1_000_000
-        raise ValueError(f"Probe firmware does not confirm this {interface} profile; restored 1 MHz")
+        raise ClockProfileUnavailable(f"Probe firmware does not confirm this {interface} profile; restored 1 MHz")
     bridge._ctx.swd_clock_hz = hz
     return {"profile": profile, "clock_hz": hz, "profile_confirmed": confirmed,
             "interface": interface,
-            "qualification": f"{interface} profile confirmed; exact target and board stability not identified by IDCODE" if confirmed else "legacy timing not hardware-qualified"}
+            "qualification": f"{interface} profile confirmed; exact target and board stability not identified by IDCODE" if confirmed else "Probe accepted clock setting; target timing not verified"}

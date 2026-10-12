@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => {
     mcu: null,
     idcode: null,
     port: null,
+    clock_hz: null as number | null,
+    clock_warning: null as string | null,
     axf: { loaded: false },
   }
 
@@ -19,6 +21,7 @@ const mocks = vi.hoisted(() => {
       listPorts: vi.fn(),
       getConfig: vi.fn(),
       updateConfig: vi.fn(),
+      refreshStatus: vi.fn(),
       connectDevice: vi.fn(),
       disconnectDevice: vi.fn(),
       parseAxf: vi.fn(),
@@ -93,6 +96,49 @@ async function mountView() {
 }
 
 describe('ConfigView', () => {
+  it('distinguishes a saved 20 MHz request from the confirmed 1 MHz fallback and offers retry', async () => {
+    Object.assign(mocks.deviceStatus, { connected: true, clock_hz: 1_000_000, clock_warning: 'SWD profile unavailable; restored 1 MHz' })
+    mocks.api.getConfig.mockResolvedValue({ swd_clock: '20000000' })
+    mocks.api.updateConfig.mockResolvedValue({ swd_clock: '20000000' })
+    const wrapper = await mountView()
+    expect(wrapper.get<HTMLInputElement>('#swd-clock').element.value).toBe('20')
+    expect(wrapper.get('[data-testid="confirmed-clock"]').text()).toContain('1 MHz')
+    expect(wrapper.get('[data-testid="clock-warning"]').text()).toContain('SWD profile unavailable')
+    expect(wrapper.text()).not.toContain('请升级下载器固件后')
+    await wrapper.get('[data-testid="retry-clock"]').trigger('click')
+    await flushPromises()
+    expect(mocks.api.updateConfig).toHaveBeenCalledWith(expect.objectContaining({ swd_clock: '20000000' }))
+    expect(mocks.api.refreshStatus).toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('does not invent a 1 MHz fallback when the actual clock is unknown', async () => {
+    Object.assign(mocks.deviceStatus, { connected: true, clock_hz: null, clock_warning: 'Fallback not acknowledged' })
+    const wrapper = await mountView()
+    expect(wrapper.get('[data-testid="confirmed-clock"]').text()).toContain('未确认')
+    expect(wrapper.text()).not.toContain('当前使用 1 MHz')
+    wrapper.unmount()
+  })
+
+  it.each(['0x0', '0xffffffff'])('never requires a target board for probe configuration (%s)', async idcode => {
+    Object.assign(mocks.deviceStatus, { connected: true, idcode, clock_hz: 1_000_000, clock_warning: 'SWD profile unavailable; restored 1 MHz' })
+    const wrapper = await mountView()
+    expect(wrapper.find('[data-testid="clock-target-warning"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="clock-warning"]').text()).toContain('均无需连接目标板')
+    wrapper.unmount()
+  })
+
+  it('displays stored Hz as MHz and saves fractional MHz without changing the API unit', async () => {
+    mocks.api.getConfig.mockResolvedValue({ swd_clock: '20000000' })
+    const wrapper = await mountView()
+    const input = wrapper.get<HTMLInputElement>('[data-testid="swd-clock"]')
+    expect(input.element.value).toBe('20')
+    await input.setValue('0.125')
+    await flushPromises()
+    expect(mocks.api.updateConfig).toHaveBeenCalledWith(expect.objectContaining({ swd_clock: '125000' }))
+    wrapper.unmount()
+  })
+
   it.each(['TEST_PORT_B', ''])('keeps user selection %s when initial config arrives late', async selected => {
     sharedRuntime.value = true
     const pending = deferred<any>()
@@ -117,14 +163,14 @@ describe('ConfigView', () => {
     mocks.api.connectDevice.mockResolvedValueOnce({ port: 'TEST_PORT_B' })
     const wrapper = await mountView()
     const clock = wrapper.get<HTMLInputElement>('[data-testid="swd-clock"]')
-    clock.element.value = '1000000'
+    clock.element.value = '1'
     await clock.trigger('input')
     await wrapper.get('[data-testid="connect-local"]').trigger('click')
     await flushPromises()
     pending.resolve({ com_port: 'TEST_PORT_A', swd_clock: '2000000' })
     await flushPromises()
     expect(wrapper.get<HTMLSelectElement>('[data-testid="local-port"]').element.value).toBe('TEST_PORT_B')
-    expect(clock.element.value).toBe('1000000')
+    expect(clock.element.value).toBe('1')
     wrapper.unmount()
   })
 
@@ -154,6 +200,8 @@ describe('ConfigView', () => {
       mcu: null,
       idcode: null,
       port: null,
+      clock_hz: null,
+      clock_warning: null,
       axf: { loaded: false },
     })
     mocks.api.listPorts.mockResolvedValue([
@@ -412,7 +460,7 @@ describe('ConfigView', () => {
     const wrapper = await mountView()
 
     expect(wrapper.find('[data-testid="auto-port"]').exists()).toBe(false)
-    await wrapper.get('[data-testid="swd-clock"]').setValue('4000000')
+    await wrapper.get('[data-testid="swd-clock"]').setValue('4')
     await flushPromises()
 
     expect(mocks.api.updateConfig).toHaveBeenCalledWith(expect.objectContaining({
@@ -426,7 +474,7 @@ describe('ConfigView', () => {
 
   it.each(['20000000', '30000000'])('saves calibrated high clock %s', async (hz) => {
     const wrapper = await mountView()
-    await wrapper.get('[data-testid="swd-clock"]').setValue(hz)
+    await wrapper.get('[data-testid="swd-clock"]').setValue(String(Number(hz) / 1_000_000))
     await flushPromises()
     expect(mocks.api.updateConfig).toHaveBeenCalledWith(expect.objectContaining({ swd_clock: hz }))
   })
@@ -436,7 +484,7 @@ describe('ConfigView', () => {
     mocks.api.updateConfig.mockRejectedValueOnce(new TypeError('Failed to fetch'))
     vi.useFakeTimers()
     try {
-      await wrapper.get('[data-testid="swd-clock"]').setValue('4000000')
+      await wrapper.get('[data-testid="swd-clock"]').setValue('4')
       await flushPromises()
       await vi.advanceTimersByTimeAsync(1500)
       await flushPromises()
@@ -446,7 +494,7 @@ describe('ConfigView', () => {
       expect(wrapper.get('[data-testid="swd-clock"]').attributes('disabled')).toBeUndefined()
 
       mocks.api.updateConfig.mockResolvedValueOnce({ swd_clock: '2000000' })
-      await wrapper.get('[data-testid="swd-clock"]').setValue('2000000')
+      await wrapper.get('[data-testid="swd-clock"]').setValue('2')
       await flushPromises()
       expect(mocks.api.updateConfig).toHaveBeenCalledTimes(2)
       expect(wrapper.get('[data-testid="local-auto-save"]').text()).toContain('已自动保存')
@@ -461,7 +509,7 @@ describe('ConfigView', () => {
     const pending = deferred<any>()
     mocks.api.updateConfig.mockReturnValueOnce(pending.promise)
     const clock = wrapper.get('[data-testid="swd-clock"]')
-    await clock.setValue('4000000')
+    await clock.setValue('4')
     expect(clock.attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="local-port"]').attributes('disabled')).toBeDefined()
     await clock.trigger('change')
@@ -477,9 +525,9 @@ describe('ConfigView', () => {
   it('rejects unnamed high clocks', async () => {
     const wrapper = await mountView()
     const input = wrapper.get('[data-testid="swd-clock"]')
-    expect(input.attributes('max')).toBe('30000000')
+    expect(input.attributes('max')).toBe('30')
 
-    await input.setValue('10000001')
+    await input.setValue('10.000001')
     await flushPromises()
 
     expect(mocks.api.updateConfig).not.toHaveBeenCalled()

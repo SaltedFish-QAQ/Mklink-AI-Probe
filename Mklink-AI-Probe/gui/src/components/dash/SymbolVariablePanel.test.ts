@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   writeSymbol: vi.fn(),
   toastError: vi.fn(),
   toastSuccess: vi.fn(),
+  toastInfo: vi.fn(),
   stale: { value: false },
   items: null as any,
   containers: null as any,
@@ -101,7 +102,7 @@ vi.mock('../../composables/useSymbolCatalog', () => ({
 }))
 
 vi.mock('../../composables/useToast', () => ({
-  useToast: () => ({ error: mocks.toastError, success: mocks.toastSuccess }),
+  useToast: () => ({ error: mocks.toastError, success: mocks.toastSuccess, info: mocks.toastInfo }),
 }))
 
 import SymbolVariablePanel from './SymbolVariablePanel.vue'
@@ -141,6 +142,11 @@ function mockPinnedWorkspace(initial: string[] = []) {
 describe('SymbolVariablePanel', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    const storage = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    })
     mocks.generation ??= ref(1)
     mocks.generation.value = 1
     mocks.stale.value = false
@@ -157,7 +163,7 @@ describe('SymbolVariablePanel', () => {
     mocks.applyingLayout.value = false
     mocks.ensureLoaded.mockResolvedValue(undefined)
     mocks.reparse.mockResolvedValue({ preserved: ['gain'], updated: [], removed: [] })
-    mocks.writeSymbol.mockResolvedValue({ path: 'gain', generation: 1, value: 1.3, verified: true })
+    mocks.writeSymbol.mockResolvedValue({ path: 'gain', generation: 1, value: 1.3, verified: false, acknowledged: true })
     mocks.applyCLayout.mockResolvedValue({
       layout: { leaf_count: 3 },
       rebind: { preserved: [], updated: [], removed: [] },
@@ -215,6 +221,68 @@ describe('SymbolVariablePanel', () => {
     expect(reopened.get('[data-testid="pinned-variables"]').text()).toContain('gain')
     expect((reopened.get('[data-testid="toggle-gain"]').element as HTMLInputElement).checked).toBe(false)
     reopened.unmount()
+  })
+
+  it('remembers independent section folds without changing shared watches or groups', async () => {
+    const server = mockPinnedWorkspace(['gain'])
+    const props = { deviceConnected: true, latestValues: {} }
+    const wrapper = mount(SymbolVariablePanel, { props, attachTo: document.body })
+    await flushPromises()
+    for (const key of ['signals', 'pinned', 'all']) {
+      await wrapper.get(`[data-testid="toggle-${key}-section"]`).trigger('click')
+    }
+    expect(wrapper.get('[data-testid="variable-search"]').isVisible()).toBe(false)
+    wrapper.unmount()
+    const reopened = mount(SymbolVariablePanel, { props, attachTo: document.body })
+    await flushPromises()
+    for (const key of ['signals', 'pinned', 'all']) {
+      expect(reopened.get(`[data-testid="toggle-${key}-section"]`).attributes('aria-expanded')).toBe('false')
+    }
+    await reopened.get('[data-testid="toggle-all-section"]').trigger('click')
+    expect(reopened.get('[data-testid="variable-search"]').isVisible()).toBe(true)
+    expect(reopened.get('[data-testid="all-variables"] [data-testid="leaf-gain"]').isVisible()).toBe(true)
+    expect(server.fetch.mock.calls.every(([, options]) => !options?.method || options.method === 'GET')).toBe(true)
+    reopened.unmount()
+  })
+
+  it('resizes with keyboard and pointer, keeps search usable and restores local heights', async () => {
+    const server = mockPinnedWorkspace(['gain'])
+    const props = { deviceConnected: true, latestValues: {} }
+    const wrapper = mount(SymbolVariablePanel, { props })
+    await flushPromises()
+    const handle = wrapper.get('[data-testid="resize-signals-section"]')
+    await handle.trigger('keydown', { key: 'ArrowDown' })
+    expect(handle.attributes('aria-valuenow')).toBe('200')
+    await handle.trigger('pointerdown', { clientY: 100, pointerId: 7, button: 0 })
+    window.dispatchEvent(new PointerEvent('pointermove', { clientY: 1000, pointerId: 7 }))
+    window.dispatchEvent(new PointerEvent('pointerup', { pointerId: 7 }))
+    await nextTick()
+    expect(Number(handle.attributes('aria-valuenow'))).toBe(Number(handle.attributes('aria-valuemax')))
+    const size = handle.attributes('aria-valuenow')
+    await wrapper.get('[data-testid="toggle-signals-section"]').trigger('click')
+    expect(wrapper.find('[data-testid="resize-signals-section"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="toggle-signals-section"]').trigger('click')
+    expect(wrapper.get('[data-testid="resize-signals-section"]').attributes('aria-valuenow')).toBe(size)
+    wrapper.unmount()
+    const reopened = mount(SymbolVariablePanel, { props })
+    await flushPromises()
+    expect(reopened.get('[data-testid="resize-signals-section"]').attributes('aria-valuenow')).toBe(size)
+    expect(server.fetch.mock.calls.every(([, options]) => !options?.method || options.method === 'GET')).toBe(true)
+    reopened.unmount()
+  })
+
+  it('includes matching favorites in search even when the favorites section is folded', async () => {
+    mockPinnedWorkspace(['gain'])
+    mocks.searchSymbols.mockResolvedValue(catalogItems)
+    const wrapper = mount(SymbolVariablePanel, { props: { deviceConnected: true, latestValues: {} } })
+    await flushPromises()
+    await wrapper.get('[data-testid="toggle-pinned-section"]').trigger('click')
+    await wrapper.get('[data-testid="variable-search"]').setValue('gain')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="all-variables"] [data-testid="leaf-gain"]').isVisible()).toBe(true)
+    await wrapper.get('[data-testid="toggle-pinned-section"]').trigger('click')
+    expect(wrapper.get('[data-testid="all-variables"] [data-testid="leaf-gain"]').isVisible()).toBe(true)
+    wrapper.unmount()
   })
 
   it('reorders/unpins without removing a watch and keeps missing favorites disabled', async () => {
@@ -391,7 +459,7 @@ describe('SymbolVariablePanel', () => {
     expect(wrapper.get('[data-testid="latest-gain"]').text()).toContain('1.25')
   })
 
-  it('writes a float from the variable row and shows the verified value', async () => {
+  it('writes a float from the variable row and shows the written value', async () => {
     const wrapper = mount(SymbolVariablePanel, {
       props: { deviceConnected: true, latestValues: { gain: 1.25 } },
     })
@@ -414,6 +482,23 @@ describe('SymbolVariablePanel', () => {
 
     expect(wrapper.get('[data-testid="edit-gain"]').attributes('disabled')).toBeDefined()
     expect(wrapper.text()).toContain('AXF 已变化')
+  })
+
+  it('shows a write acknowledgement without claiming verification or retrying', async () => {
+    mocks.writeSymbol.mockResolvedValueOnce({ path: 'gain', generation: 1, value: 1.3,
+      acknowledged: true, verified: false, mode: 'cdc-mux' })
+    const wrapper = mount(SymbolVariablePanel, {
+      props: { deviceConnected: true, latestValues: { gain: 1.25 } },
+    })
+    await flushPromises()
+    await wrapper.get('[data-testid="edit-gain"]').trigger('click')
+    await wrapper.get('[data-testid="write-input-gain"]').setValue('1.3')
+    await wrapper.get('[data-testid="write-gain"]').trigger('click')
+    await flushPromises()
+    expect(mocks.writeSymbol).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[data-testid="write-ok-gain"]').text()).toBe('已写入: 1.300000')
+    expect(mocks.toastInfo).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
   })
 
   it('expands search matches and restores the previous expansion state when cleared', async () => {

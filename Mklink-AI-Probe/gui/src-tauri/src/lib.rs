@@ -1,4 +1,5 @@
 mod desktop_clipboard;
+mod sidecar_diagnostics;
 mod site_agent_config;
 mod site_agent_network;
 mod site_agent_secret;
@@ -47,6 +48,7 @@ struct Sidecar {
     port: Mutex<Option<u16>>,
     instance_id: String,
     runtime_info_path: PathBuf,
+    startup_error: Mutex<Option<String>>,
     project_root: Mutex<String>,
     site_agent_root: Mutex<Option<PathBuf>>,
     #[cfg(target_os = "windows")]
@@ -91,7 +93,7 @@ fn choose_sidecar_launch(
 
 fn find_bundled_sidecar() -> Option<std::path::PathBuf> {
     let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let candidate = directory.join("mklink-sidecar.exe");
+    let candidate = directory.join(if cfg!(windows) { "mklink-sidecar.exe" } else { "mklink-sidecar" });
     candidate.is_file().then_some(candidate)
 }
 
@@ -400,9 +402,11 @@ fn spawn_sidecar(
     runtime_info_path: &Path,
     project_root: &str,
 ) -> Result<Child, String> {
+    #[cfg(target_os = "windows")]
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
     // CREATE_NO_WINDOW = 0x08000000 — prevents Python console window from flashing
+    #[cfg(target_os = "windows")]
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     let (mut command, label) = match launch {
@@ -441,13 +445,18 @@ fn spawn_sidecar(
             command.env("MKLINK_STCP_LIBRARY", stcp_library);
         }
     }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
+    let log_path = runtime_info_path.with_extension("log");
+    let log = sidecar_diagnostics::open(&log_path)
+        .map_err(|error| format!("Cannot create desktop startup log {}: {error}", log_path.display()))?;
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let mut child = command
         .spawn()
-        .map_err(|e| format!("Failed to start sidecar ({}): {}", label, e))
+        .map_err(|e| format!("Failed to start sidecar ({}): {}", label, e))?;
+    sidecar_diagnostics::drain(child.stdout.take().expect("piped stdout"), log.clone());
+    sidecar_diagnostics::drain(child.stderr.take().expect("piped stderr"), log);
+    Ok(child)
 }
 
 fn retain_child_if_registered<T, E>(
@@ -489,6 +498,16 @@ fn spawn_registered_sidecar(
             let _ = child.wait();
         },
     )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_registered_sidecar(
+    state: &Sidecar,
+    launch: &SidecarLaunch,
+    port: u16,
+    project_root: &str,
+) -> Result<Child, String> {
+    spawn_sidecar(launch, port, &state.instance_id, &state.runtime_info_path, project_root)
 }
 
 fn request_sidecar_shutdown(port: u16, instance_id: &str) -> bool {
@@ -661,18 +680,18 @@ fn wait_for_runtime_endpoint(state: &Sidecar) -> Result<BackendEndpoint, String>
                 }
             }
         }
-        let exited = {
+        let exit_status = {
             let mut guard = state.child.lock().map_err(|error| error.to_string())?;
             match guard.as_mut() {
                 Some(child) => child
                     .try_wait()
-                    .map_err(|error| error.to_string())?
-                    .is_some(),
-                None => true,
+                    .map_err(|error| error.to_string())?,
+                None => return Err("Desktop proxy is not running".into()),
             }
         };
-        if exited {
-            return Err("The sidecar exited before publishing its API endpoint".into());
+        if let Some(status) = exit_status {
+            return Err(format!("Desktop proxy exited ({status}) before publishing its endpoint. Log: {}",
+                               state.runtime_info_path.with_extension("log").display()));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -689,6 +708,19 @@ fn start_owned_sidecar(
 }
 
 fn start_owned_sidecar_locked(
+    state: &Sidecar,
+    project_root: Option<String>,
+    preferred_port: Option<u16>,
+) -> Result<BackendEndpoint, String> {
+    *state.startup_error.lock().map_err(|error| error.to_string())? = None;
+    let result = start_owned_sidecar_attempt(state, project_root, preferred_port);
+    if let Err(error) = &result {
+        *state.startup_error.lock().map_err(|error| error.to_string())? = Some(error.clone());
+    }
+    result
+}
+
+fn start_owned_sidecar_attempt(
     state: &Sidecar,
     project_root: Option<String>,
     preferred_port: Option<u16>,
@@ -788,6 +820,9 @@ async fn restart_sidecar(app: tauri::AppHandle) -> Result<BackendEndpoint, Strin
 
 #[tauri::command]
 fn backend_endpoint(state: State<Sidecar>) -> Result<Option<BackendEndpoint>, String> {
+    if let Some(error) = state.startup_error.lock().map_err(|error| error.to_string())?.as_ref() {
+        return Err(error.clone());
+    }
     current_endpoint(state.inner())
 }
 
@@ -897,6 +932,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(Sidecar {
+            startup_error: Mutex::new(None),
             lifecycle: Mutex::new(()),
             shutdown: shutdown.clone(),
             child: Mutex::new(None),
@@ -1124,6 +1160,7 @@ mod tests {
     #[test]
     fn remote_credentials_are_scoped_to_valid_probe_identities() {
         let state = Sidecar {
+            startup_error: Mutex::new(None),
             lifecycle: Mutex::new(()),
             shutdown: std::sync::Arc::new(AtomicBool::new(false)),
             child: Mutex::new(None), port: Mutex::new(None), instance_id: "test".into(),
@@ -1158,6 +1195,7 @@ mod tests {
             .creation_flags(0x08000000)
             .spawn().unwrap();
         let state = Sidecar {
+            startup_error: Mutex::new(None),
             lifecycle: Mutex::new(()),
             shutdown: std::sync::Arc::new(AtomicBool::new(false)),
             child: Mutex::new(Some(child)), port: Mutex::new(None),
@@ -1224,6 +1262,7 @@ mod tests {
         assign_to_job(&job, &worker).expect("assign untracked worker");
 
         let state = Sidecar {
+            startup_error: Mutex::new(None),
             lifecycle: Mutex::new(()),
             shutdown: std::sync::Arc::new(AtomicBool::new(false)),
             child: Mutex::new(Some(tracked)),

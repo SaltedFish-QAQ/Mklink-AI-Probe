@@ -105,6 +105,10 @@ def test_find_bootloader_disk_uses_uf2_marker(monkeypatch, tmp_path):
     assert fc._find_bootloader_disk() == str(tmp_path).rstrip("\\/") + ("\\" if os.name == "nt" else "/")
 
 
+def test_shared_finder_accepts_verified_cherryuf2_without_marker(tmp_path):
+    assert fc._wait_for_bootloader_drive(None, .1, lambda: str(tmp_path)) == str(tmp_path)
+
+
 def test_upgrade_probe_firmware_returns_up_to_date_without_reboot(monkeypatch, tmp_path):
     disk = tmp_path / "disk"
     disk.mkdir()
@@ -506,3 +510,34 @@ def test_firmware_download_endpoint_rejects_hpmlink_v3(tmp_path):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "HPMLink firmware is only available for V4"
+
+@pytest.mark.parametrize('unavailable', [None, 'github', 'gitee'])
+def test_online_firmware_compares_channels_and_keeps_exact_model(monkeypatch, unavailable):
+    def entry(name, source):
+        info = fc.parse_firmware_filename(name)
+        info.download_urls = {source: f'https://{source}.example/{name}'}
+        return info
+    inventories = {
+        'github': [entry('MicroLink_V3.6.3.uf2', 'github'), entry('HPMLink_V4.6.8.uf2', 'github')],
+        'gitee': [entry('MicroLink_V3.6.4.uf2', 'gitee'), entry('MicroLink_V4.6.8.uf2', 'gitee')],
+    }
+    monkeypatch.setattr(fc, '_remote_firmwares_from_source',
+                        lambda source, **kwargs: None if source == unavailable else inventories[source])
+    info = fc._remote_firmware('V3')
+    assert info.version == fc.Version(3, 6, 3 if unavailable == 'gitee' else 4)
+    assert info.model == 'V3' and info.family == 'microlink'
+    assert info.download_source == ('github' if unavailable == 'gitee' else 'gitee')
+    assert fc._remote_firmware('V3', family='hpmlink') is None
+    if unavailable != 'gitee':
+        inventories['gitee'] = [entry('MicroLink_V3.6.5.uf2', 'gitee')]
+        assert fc._remote_firmware('V3').version == fc.Version(3, 6, 5)
+
+
+def test_online_firmware_requests_cache_revalidation(monkeypatch):
+    requested = []
+    def fetch(request, **kwargs):
+        requested.append(request)
+        return io.BytesIO(b'{"schema":"mklink-firmware-v1","firmwares":[]}')
+    monkeypatch.setattr(fc, 'urlopen', fetch)
+    assert fc._remote_firmwares_from_source('github') == []
+    assert requested[0].get_header('Cache-control') == 'no-cache'
