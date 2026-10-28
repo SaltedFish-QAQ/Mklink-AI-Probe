@@ -11,11 +11,11 @@
         >{{ tab.label }}</button>
         <a
           class="external-link"
-          data-testid="online-docs-link"
-          href="https://microboot.readthedocs.io/zh-cn/latest/tools/microlink/microlink/"
+          data-testid="official-website-link"
+          href="https://microkeenai.com/"
           target="_blank"
           rel="noopener noreferrer"
-        >{{ tr('在线文档', 'Docs') }}</a>
+        >{{ tr('官方网站', 'Website') }}</a>
         <details class="store-menu" data-testid="taobao-menu">
           <summary class="external-link" data-testid="taobao-link">{{ tr('淘宝店铺', 'Stores') }}</summary>
           <div class="store-menu-panel">
@@ -81,9 +81,12 @@
     <div class="app-main" :inert="IS_REMOTE && backendState !== 'alive'">
       <DashboardView v-if="initialBackendReady && dashboardVisited" v-show="currentTab === 'dashboard'" />
       <router-view v-if="initialBackendReady" v-slot="{ Component, route: viewRoute }">
+        <!-- Firmware selection keeps its pending result visible while a probe
+             switch still invalidates both cached target download forms. -->
+        <component :is="Component" v-if="viewRoute.name === 'config'" :key="viewRoute.path" />
         <!-- Override the shared v-if branch key so cached flash pages stay distinct. -->
         <KeepAlive :key="downloadViewKey" include="OnlineFlashView,OfflineFlashView">
-          <component :is="Component" v-if="viewRoute.name !== 'dashboard'" :key="viewRoute.path" />
+          <component :is="Component" v-if="viewRoute.name !== 'dashboard' && viewRoute.name !== 'config'" :key="viewRoute.path" />
         </KeepAlive>
       </router-view>
       <div v-else-if="backendState === 'starting'" class="backend-starting" data-testid="backend-starting" role="status">
@@ -104,7 +107,7 @@
         :title="tr('还有其他客户端时后台继续运行；全部退出且无在途任务后约5秒自动停止采集并释放下载器。', 'The backend stays alive for other clients. About 5 seconds after all clients leave and pending work completes, it stops capture and releases the probe.')">
         {{ IS_REMOTE ? tr('远程会话 · 固定目标 · 不回退本地', 'Remote session · Fixed target · No local fallback') : tr('共享后台 · CDC · GUI / AI 共用连接', 'Shared backend · CDC · GUI / AI connection') }}
       </span>
-      <VersionHistoryPopover :version="appVersion" :build-commit="buildCommit" />
+      <VersionHistoryPopover :version="appVersion" />
     </footer>
     <ToastContainer />
   </div>
@@ -168,7 +171,6 @@ watch(() => backendState.value === 'alive' ? sharedRuntime?.value === true : und
   }) : startBrowserSessionLease(!isTauri)
 }, { immediate: true })
 const appVersion = __APP_VERSION__
-const buildCommit = __APP_BUILD_COMMIT__
 
 const currentTab = computed(() => route.name as string)
 const dashboardVisited = ref(false)
@@ -177,8 +179,8 @@ watch(currentTab, name => { if (name === 'dashboard') dashboardVisited.value = t
 const tabs = computed(() => (IS_REMOTE ? [{ key: 'dashboard', label: tr('仪表盘', 'Dashboard') }] : [
   { key: 'config', label: tr('配置', 'Config') },
   { key: 'dashboard', label: tr('仪表盘', 'Dashboard') },
-  { key: 'offline-flash', label: tr('脱机烧录', 'Offline Flash') },
   { key: 'online-flash', label: tr('在线烧录', 'Online Flash') },
+  { key: 'offline-flash', label: tr('脱机烧录', 'Offline Flash') },
   { key: 'remote-service', label: tr('远程服务', 'Remote Service') },
 ]))
 
@@ -260,17 +262,21 @@ body {
   display: flex;
   gap: 2px;
 }
+.nav-tab, .external-link {
+  height: 44px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.5;
+}
 .nav-tab {
   background: none;
   border: none;
   padding: 10px 14px;
-  font-size: 13px;
-  font-weight: 500;
   color: var(--muted);
   cursor: pointer;
   border-bottom: 2px solid transparent;
   transition: color .15s, background-color .15s, border-color .15s;
-  font-family: var(--font-body);
   white-space: nowrap;
 }
 .nav-tab:hover { color: var(--fg); border-bottom-color: var(--border); }
@@ -290,10 +296,8 @@ body {
 .external-link {
   display: inline-flex;
   align-items: center;
-  height: 44px;
   padding: 0 10px;
   color: var(--muted);
-  font-size: 12px;
   text-decoration: none;
   white-space: nowrap;
   border-bottom: 2px solid transparent;

@@ -8,6 +8,7 @@ MKLink Serial Bridge — 核心串口通信类。
 from __future__ import annotations
 
 import codecs
+import logging
 import re
 import threading
 import time
@@ -15,9 +16,11 @@ from collections.abc import Callable
 from pathlib import Path
 
 import serial
-from mklink._isolated_serial import IsolatedSerial
+from mklink._isolated_serial import IsolatedSerial, SerialCleanupPending
 import os
 import sys
+import uuid
+from mklink.connection_diagnostics import event, error_detail
 
 from mklink._types import (
     DEFAULT_BAUDRATE,
@@ -92,6 +95,7 @@ class MKLinkSerialBridge:
         self._cmd_lock = threading.RLock()  # Includes explicit framed/legacy transitions.
         self._mux = None
         self._mux_supported = None
+        self._firmware_capabilities: frozenset[str] | None = None
         self._echo_enabled = False
         self._echo_prefix = "[SERIAL] "
         self._echo_offset = 0
@@ -99,6 +103,21 @@ class MKLinkSerialBridge:
         self._echo_callback: Callable[[str], None] | None = None
         self._transport_error: Exception | None = None
         self.last_connect_error: str | None = None
+        self._diagnostic_id = uuid.uuid4().hex[:12]
+        self._diagnostic_started = time.monotonic()
+        self._diagnostic_failure_logged = False
+        self._diagnostic_lock = threading.Lock()
+
+    def _record_transport_error(self, error, source):
+        self._transport_error = error
+        with self._diagnostic_lock:
+            if self._diagnostic_failure_logged:
+                return
+            self._diagnostic_failure_logged = True
+        event('transport.failed', connection=self._diagnostic_id, port=self._port,
+              source=source, state=self._ctx.state.name,
+              elapsed_ms=round((time.monotonic()-self._diagnostic_started)*1000),
+              error=error_detail(error))
 
     # ------------------------------------------------------------------
     # 连接管理
@@ -106,12 +125,19 @@ class MKLinkSerialBridge:
     def supports_dump_write(self) -> bool:
         if self._mux_supported is True:
             return True
-        response = self.send_command("cmd.get_version()", timeout=3.0)
-        return any(line.strip() == "DUMP_WRITE=1" for line in response.splitlines())
+        return "DUMP_WRITE=1" in self._get_firmware_capabilities()
 
     def supports_hpm_dump_write(self) -> bool:
-        response = self.send_command("cmd.get_version()", timeout=3.0)
-        return any(line.strip() == "DUMP_WRITE_HPM=1" for line in response.splitlines())
+        return "DUMP_WRITE_HPM=1" in self._get_firmware_capabilities()
+
+    def _get_firmware_capabilities(self) -> frozenset[str]:
+        # Capture all advertised features before entering MUX. Later dashboard
+        # starts must not leave a running RTT/Watch session to query legacy REPL.
+        with self._cmd_lock:
+            if self._firmware_capabilities is None:
+                response = self.send_command("cmd.get_version()", timeout=3.0)
+                self._firmware_capabilities = frozenset(line.strip() for line in response.splitlines())
+            return self._firmware_capabilities
 
     def _verify_identity(self) -> bool:
         try:
@@ -124,13 +150,39 @@ class MKLinkSerialBridge:
         )
 
     def connect(self, *, recover_stream: bool = True) -> bool:
+        self._diagnostic_id = uuid.uuid4().hex[:12]
+        self._diagnostic_started = time.monotonic()
+        self._diagnostic_failure_logged = False
+        event('connection.opening', connection=self._diagnostic_id, port=self._port)
+        try:
+            connected = self._connect(recover_stream=recover_stream)
+            event('connection.ready' if connected else 'connection.open_failed',
+                  connection=self._diagnostic_id, port=self._port, reason=self.last_connect_error,
+                  elapsed_ms=round((time.monotonic()-self._diagnostic_started)*1000))
+            return connected
+        except BaseException as error:
+            event('connection.open_failed', connection=self._diagnostic_id, port=self._port,
+                  error=error_detail(error))
+            self.close()
+            raise
+
+    def _connect(self, *, recover_stream: bool = True) -> bool:
         """打开串口并同步设备状态（等待 >>> 提示符）。"""
         from mklink.probes import require_runtime_port
+        # A failed worker shutdown must remain reachable across retries.
+        if self._serial is not None and self._serial.is_open:
+            self.close()
         self._transport_error = None
         self.last_connect_error = 'Command port did not return a prompt; check the probe firmware/USB connection and retry'
         self._mux_supported = None  # Re-negotiate after reconnect/firmware changes.
+        self._firmware_capabilities = None
         # 进程级互斥：获取文件锁
         if not self._port_lock.acquire():
+            error = getattr(self._port_lock, 'last_error', None)
+            if error is not None:
+                self.last_connect_error = f'Cannot access command-port lock: {error}'
+                print(f'[FAIL] {self.last_connect_error}')
+                return False
             self.last_connect_error = 'Command port is owned by another process; close its connection before retrying'
             print(f"[FAIL] 串口 {self._port} 正被其他进程使用")
             print("       请等待其他操作完成，或关闭占用串口的进程后重试。")
@@ -149,8 +201,13 @@ class MKLinkSerialBridge:
             # Opening the Windows worker/serial handle can take time. Recheck
             # before clearing buffers, starting a reader or sending sync/stop.
             require_runtime_port(self._port)
+        except SerialCleanupPending as e:
+            self._serial = e.transport
+            raise
         except (serial.SerialException, ConnectionError) as e:
             self.last_connect_error = f'Could not open command port: {e}'
+            event('connection.port_open_failed', connection=self._diagnostic_id, port=self._port,
+                  error=error_detail(e))
             self.close()
             msg = str(e).lower()
             if "access" in msg or "denied" in msg or "already open" in msg or "in use" in msg:
@@ -159,9 +216,12 @@ class MKLinkSerialBridge:
             else:
                 print(f"[FAIL] 无法打开端口 {self._port}: {e}")
             return False
-        except BaseException:
-            self.close()
-            raise
+        # A closed IDE can leave the probe's logical DAP session reserved.
+        # OS-exclusive ownership, never idle time, permits HostStatus cleanup.
+        from .dap_recovery import reconcile_dap_owner
+        recovery = reconcile_dap_owner(self._port)
+        logging.getLogger(__name__).info('DAP ownership reconciliation on %s: %s',
+                                         self._port, recovery)
         self._ctx.state = DeviceState.CONNECTING
         self._running = True
 
@@ -207,7 +267,8 @@ class MKLinkSerialBridge:
         # guess binary framing on an arbitrary serial assistant/legacy stream.
         if recover_stream and self._mux_marker.exists():
             from mklink.mux import MuxTransport
-            transport = self._mux = MuxTransport(self._serial.write, self._cmd_lock)
+            transport = self._mux = MuxTransport(self._serial.write, self._cmd_lock,
+                                               diagnostic_context={'connection': self._diagnostic_id, 'port': self._port})
             try:
                 transport.request(1)  # Fresh epoch, no claim or target operation.
                 transport.close()    # Explicit EXIT, never replay the old request.
@@ -236,9 +297,7 @@ class MKLinkSerialBridge:
             if self._reader_thread.is_alive():
                 # reader 线程未退出，关闭串口强制终止
                 self._ctx.state = DeviceState.ERROR
-                if self._serial and self._serial.is_open:
-                    self._serial.close()
-                self._port_lock.release()
+                self.close()
                 return False
 
         try:
@@ -290,12 +349,7 @@ class MKLinkSerialBridge:
 
         # 恢复也失败，释放资源
         self._ctx.state = DeviceState.ERROR
-        self._running = False
-        if self._reader_thread and self._reader_thread.is_alive():
-            self._reader_thread.join(timeout=1.0)
-        if self._serial and self._serial.is_open:
-            self._serial.close()
-        self._port_lock.release()
+        self.close()
         return False
 
     def _is_known_command_port(self) -> bool:
@@ -320,6 +374,11 @@ class MKLinkSerialBridge:
 
     def close(self):
         """关闭串口连接并释放文件锁。"""
+        was_open = self._running or (self._serial is not None and self._serial.is_open)
+        if was_open:
+            event('connection.closing', connection=self._diagnostic_id, port=self._port,
+                  state=self._ctx.state.name, transport_failed=self._transport_error is not None,
+                  elapsed_ms=round((time.monotonic()-self._diagnostic_started)*1000))
         if self._mux is not None:
             try:
                 self._mux.close()
@@ -333,12 +392,20 @@ class MKLinkSerialBridge:
         if self._reader_thread and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=2.0)
         if self._serial and self._serial.is_open:
-            self._serial.close()
+            try:
+                self._serial.close()
+            except Exception:
+                if self._serial.is_open:
+                    raise  # Still owns IO (or exit unconfirmed): retain locks.
+            if self._serial.is_open:
+                raise serial.SerialException('Serial port close is unconfirmed; ownership retained')
         # 释放进程级文件锁
         self._port_lock.release()
         # 重置上下文
         self._ctx = DeviceContext()
         self._ctx.state = DeviceState.DISCONNECTED
+        if was_open:
+            event('connection.closed', connection=self._diagnostic_id, port=self._port)
 
     def enter_bootloader(self) -> None:
         """Ask the probe to switch to its UF2 bootloader and close CDC."""
@@ -354,8 +421,7 @@ class MKLinkSerialBridge:
     # ------------------------------------------------------------------
     def supports_multiplex(self) -> bool:
         if self._mux_supported is None:
-            response = self.send_command('cmd.get_version()', timeout=3)
-            self._mux_supported = any(line.strip() == 'MUX_TARGET=1' for line in response.splitlines())
+            self._mux_supported = 'MUX_TARGET=1' in self._get_firmware_capabilities()
         return self._mux_supported
 
     def enable_multiplex(self):
@@ -366,7 +432,8 @@ class MKLinkSerialBridge:
                 return self._mux
             if not self.supports_multiplex():
                 return None
-            transport = MuxTransport(self._serial.write, self._cmd_lock)
+            transport = MuxTransport(self._serial.write, self._cmd_lock,
+                                     diagnostic_context={'connection': getattr(self, '_diagnostic_id', None), 'port': getattr(self, '_port', None)})
             self._mux = transport  # The existing reader changes decoder before entry.
             try:
                 self._mux_marker.parent.mkdir(parents=True, exist_ok=True)
@@ -447,7 +514,7 @@ class MKLinkSerialBridge:
             try:
                 self._serial.write((cmd + "\n").encode("utf-8"))
             except serial.SerialException as e:
-                self._transport_error = e
+                self._record_transport_error(e, 'serial')
                 self._ctx.state = DeviceState.ERROR
                 self._echo_enabled = False
                 self._echo_callback = None
@@ -506,7 +573,7 @@ class MKLinkSerialBridge:
                 self._serial.write((cmd + "\n").encode("utf-8"))
                 self._serial.flush()
             except serial.SerialException as e:
-                self._transport_error = e
+                self._record_transport_error(e, 'serial')
                 self._ctx.state = DeviceState.ERROR
                 raise ConnectionError(f"写入串口失败: {e}") from e
 
@@ -769,7 +836,7 @@ class MKLinkSerialBridge:
                 try:
                     self._serial.write(stop_command)
                 except serial.SerialException as error:
-                    self._transport_error = error
+                    self._record_transport_error(error, 'serial')
                     self._ctx.state = DeviceState.ERROR
                     return False
                 except AttributeError:
@@ -797,7 +864,7 @@ class MKLinkSerialBridge:
                     (MKLINK_IDENTITY_COMMAND + "\n").encode("utf-8")
                 )
             except serial.SerialException as error:
-                self._transport_error = error
+                self._record_transport_error(error, 'serial')
                 self._ctx.state = DeviceState.ERROR
                 return False
             except AttributeError:
@@ -882,7 +949,7 @@ class MKLinkSerialBridge:
         try:
             self._serial.write(data)
         except serial.SerialException as error:
-            self._transport_error = error
+            self._record_transport_error(error, 'serial')
             self._ctx.state = DeviceState.ERROR
             raise ConnectionError(f"写入串口失败: {error}") from error
 
@@ -917,7 +984,7 @@ class MKLinkSerialBridge:
                     mux = self._mux
                     if mux is not None:
                         mux.fail(error)
-                    self._transport_error = error
+                    self._record_transport_error(error, 'serial_reader')
                     self._ctx.state = DeviceState.ERROR
                     self._prompt_event.set()  # 唤醒等待者
                 break

@@ -2,7 +2,9 @@ import type { TargetRecord } from './onlineFlash'
 
 export interface OfflineDiskStatus {
   probe_id?: string
-  probes?: Array<{ probe_id: string; port: string }>
+  probes?: Array<{ probe_id: string; port: string; alias?: string; description?: string }>
+  model?: 'V2' | 'V3' | 'V4' | null
+  version?: string | null
   reason?: string
   available: boolean
   disk_path: string | null
@@ -49,7 +51,42 @@ export interface HpmOfflineOtp {
   expected_hard_lock: string
   confirm_irreversible: boolean
 }
+export const HPM_ISP_BAUD_RATES = [115200, 1000000, 2000000, 5000000, 10000000] as const
+export interface HpmIspConfig {
+  baud_rate: number
+  connect_timeout_ms: number
+  command_timeout_ms: number
+  flash_base: string
+  flash_size?: string
+  sector_size: number
+  memory_id: string
+  config_address: string
+  nor_options: string[]
+  rearm_mode: 'isp_reconnect'
+  completion: {
+    beep: boolean
+    beep_duration_ms?: number
+    reset: 'none' | 'software' | 'power_cycle'
+    restore_voltage_mv: number | null
+    power_off_ms: number
+  }
+}
+export interface HpmIspOfflineOtp {
+  target_identity: { chip_id: number; rom_version: number; soc_revision: number }
+  words: { word: number; expected: number; desired: number }[]
+  confirm_irreversible: true
+}
+
 export interface OfflineConfigPayload {
+  programming_protocol?: 'debug' | 'hpm_rom_isp_uart'
+  hpm_isp?: HpmIspConfig
+  hpm_isp_otp?: HpmIspOfflineOtp
+  beep_on_completion?: boolean
+  beep_duration_ms?: number
+  reset_after_download?: boolean
+  verify_after_download?: boolean
+  reset_mode?: 'software' | 'hardware' | 'power_cycle'
+  reset_voltage_mv?: number | null
   model: 'V2' | 'V3' | 'V4'
   port?: string | null
   script_name: string
@@ -85,6 +122,7 @@ export interface OfflineSecurityCapability {
 }
 
 export interface OfflinePreview {
+  required_capabilities?: string[]
   model: 'V2' | 'V3' | 'V4'
   script_name: string
   script: string
@@ -102,7 +140,7 @@ export interface OfflineDeployResult {
 
 export interface OfflineTriggerResult {
   acquisition?: { errors: string[] }
-  status: 'completed' | 'failed'
+  status: 'completed' | 'failed' | 'unknown'
   lines: string[]
 }
 

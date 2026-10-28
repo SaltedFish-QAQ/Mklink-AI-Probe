@@ -1,10 +1,13 @@
-import { flushPromises, mount } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
+import { h, KeepAlive, ref } from 'vue'
 import OfflineFlashView from './OfflineFlashView.vue'
 import DeviceConfigurationPanel from '../components/DeviceConfigurationPanel.vue'
 import router from '../router'
 import { notifyPacksChanged, publishOnlineTarget } from '../lib/targetSelection'
+
+enableAutoUnmount(afterEach)
 
 const offlineMocks = vi.hoisted(() => ({
   getStatus: vi.fn(),
@@ -37,6 +40,237 @@ vi.mock('../composables/useOnlineFlashApi', () => ({
 }))
 
 describe('OfflineFlashView', () => {
+  it('shows the firmware upgrade reason and keeps verification unchecked after a confirmed rejection', async () => {
+    pickerMocks.pickFlmFile.mockResolvedValue(new File(['algorithm'], 'Device.FLM'))
+    offlineMocks.deploy.mockRejectedValueOnce(Error('请升级下载器固件后再关闭烧录后校验'))
+    offlineMocks.deploymentStatus.mockResolvedValueOnce({ state: 'failed', result: null, error: '请升级下载器固件后再关闭烧录后校验' })
+    const wrapper = mount(OfflineFlashView)
+    try {
+      await flushPromises()
+      await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+      await wrapper.get('[data-testid="offline-add-flm"]').trigger('click')
+      await flushPromises()
+      const input = wrapper.get('[data-testid="offline-firmware-input"]')
+      Object.defineProperty(input.element, 'files', { value: [new File(['hex'], 'firmware.hex')] })
+      await input.trigger('change')
+      await wrapper.get('[data-testid="offline-verify"]').setValue(false)
+      await wrapper.get('[data-testid="offline-deploy"]').trigger('click')
+      await flushPromises()
+      expect(wrapper.text()).toContain('请升级下载器固件后再关闭烧录后校验')
+      expect(wrapper.get<HTMLInputElement>('[data-testid="offline-verify"]').element.checked).toBe(false)
+      expect(wrapper.find('[data-testid="deployment-query"]').exists()).toBe(false)
+      expect(wrapper.get('[data-testid="offline-trigger"]').attributes('disabled')).toBeDefined()
+      expect(offlineMocks.trigger).not.toHaveBeenCalled()
+    } finally { wrapper.unmount() }
+  })
+  it.each(['bin', 'hex'])('persists the default-on verification choice and uses it for %s preview/deployment', async format => {
+    pickerMocks.pickFlmFile.mockResolvedValue(new File(['algorithm'], 'Device.FLM'))
+    let wrapper = mount(OfflineFlashView)
+    try {
+      await flushPromises()
+      expect(wrapper.get<HTMLInputElement>('[data-testid="offline-verify"]').element.checked).toBe(true)
+      await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+      await wrapper.get('[data-testid="offline-add-flm"]').trigger('click')
+      await flushPromises()
+      const input = wrapper.get('[data-testid="offline-firmware-input"]')
+      Object.defineProperty(input.element, 'files', { configurable: true, value: [new File(['data'], `firmware.${format}`)] })
+      await input.trigger('change')
+      await wrapper.get('[data-testid="offline-verify"]').setValue(false)
+      expect(wrapper.text()).toContain('HEX 格式检查仍保留')
+      await wrapper.get('[data-testid="offline-preview"]').trigger('click')
+      await flushPromises()
+      expect(offlineMocks.preview.mock.lastCall?.[0]).toMatchObject({ verify_after_download: false, reset_after_download: true })
+      await wrapper.get('[data-testid="offline-deploy"]').trigger('click')
+      await flushPromises()
+      expect(offlineMocks.deploy.mock.lastCall?.[0]).toMatchObject({ verify_after_download: false })
+      await wrapper.get('[data-testid="offline-verify"]').setValue(true)
+      expect(wrapper.get('[data-testid="offline-trigger"]').attributes('disabled')).toBeDefined()
+      await wrapper.get('[data-testid="offline-preview"]').trigger('click')
+      await flushPromises()
+      expect(offlineMocks.preview.mock.lastCall?.[0]).toMatchObject({ verify_after_download: true })
+      await wrapper.get('[data-testid="offline-verify"]').setValue(false)
+      wrapper.unmount()
+      wrapper = mount(OfflineFlashView)
+      await flushPromises()
+      expect(wrapper.get<HTMLInputElement>('[data-testid="offline-verify"]').element.checked).toBe(false)
+    } finally { wrapper.unmount() }
+  })
+  it.each(['STM32F103RE', 'HPM5301'])('shows replacement timing only for multiple boards: %s', async part => {
+    onlineMocks.searchTargets.mockResolvedValue([{ part_number: part, vendor: part.startsWith('HPM') ? 'HPMicro' : 'STMicroelectronics', installed: true, source: 'builtin' }])
+    const wrapper = mount(OfflineFlashView)
+    try {
+      await flushPromises()
+      await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+      await wrapper.get('.target-result').trigger('click')
+      await flushPromises()
+      const count = wrapper.get('[data-testid="offline-automatic-count"]')
+      expect((count.element as HTMLInputElement).value).toBe('1')
+      expect(wrapper.find('[data-testid="offline-connection-timeout"]').exists()).toBe(false)
+      await count.setValue('3')
+      await wrapper.get('[data-testid="offline-connection-timeout"]').setValue('15000')
+      await count.setValue('1')
+      expect(wrapper.find('[data-testid="offline-connection-timeout"]').exists()).toBe(false)
+      await count.setValue('2')
+      expect(wrapper.get<HTMLInputElement>('[data-testid="offline-connection-timeout"]').element.value).toBe('15000')
+    } finally { wrapper.unmount() }
+  })
+  it('deploys ARM reset modes and confirms the selected power-cycle voltage before triggering', async () => {
+    pickerMocks.pickFlmFile.mockResolvedValue(new File(['algorithm'], 'Device.FLM'))
+    const wrapper = mount(OfflineFlashView, { global: { stubs: { teleport: true } } })
+    try {
+      await flushPromises()
+      await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+      await wrapper.get('[data-testid="offline-add-flm"]').trigger('click')
+      await flushPromises()
+      const input = wrapper.get('[data-testid="offline-firmware-input"]')
+      Object.defineProperty(input.element, 'files', { configurable: true, value: [new File(['hex'], 'firmware.hex')] })
+      await input.trigger('change')
+      expect(wrapper.find('[data-testid="offline-connection-timeout"]').exists()).toBe(false)
+      await wrapper.get('[data-testid="offline-automatic-count"]').setValue('2')
+      expect(wrapper.text()).toContain('目标连接／换板等待时间（ms）')
+      expect(wrapper.text()).not.toContain('IDCODE 超时')
+      const reset = wrapper.get('[data-testid="offline-reset-mode"]')
+      expect(reset.findAll('option').map(option => option.attributes('value'))).toEqual(['software', 'hardware', 'power_cycle'])
+      for (const mode of ['software', 'hardware', 'power_cycle']) {
+        await reset.setValue(mode)
+        expect(wrapper.get('[data-testid="offline-trigger"]').attributes('disabled')).toBeDefined()
+        if (mode === 'power_cycle') await wrapper.get('[data-testid="offline-reset-voltage"]').setValue('1800')
+        await wrapper.get('[data-testid="offline-deploy"]').trigger('click')
+        await flushPromises()
+        expect(offlineMocks.deploy.mock.lastCall?.[0]).toMatchObject({
+          reset_after_download: true, reset_mode: mode, reset_voltage_mv: mode === 'power_cycle' ? 1800 : null,
+        })
+      }
+      await wrapper.get('[data-testid="offline-trigger"]').trigger('click')
+      expect(wrapper.get('[role="alertdialog"]').text()).toContain('恢复 1.8V')
+      expect(offlineMocks.trigger).not.toHaveBeenCalled()
+      await wrapper.get('[data-testid="confirmation-cancel"]').trigger('click')
+      await flushPromises()
+      expect(offlineMocks.trigger).not.toHaveBeenCalled()
+      await wrapper.get('[data-testid="offline-trigger"]').trigger('click')
+      await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+      await flushPromises()
+      expect(offlineMocks.trigger).toHaveBeenCalledOnce()
+      await wrapper.get('[data-testid="offline-reset-voltage"]').setValue('3300')
+      expect(wrapper.get('[data-testid="offline-trigger"]').attributes('disabled')).toBeDefined()
+    } finally { wrapper.unmount() }
+  })
+  it('keeps chip input enabled and focused while suggestions are in flight', async () => {
+    vi.useFakeTimers()
+    const wrapper = mount(OfflineFlashView, { attachTo: document.body })
+    try {
+      await flushPromises()
+      let finish!: (value: unknown[]) => void
+      onlineMocks.searchTargets.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+      const input = wrapper.get<HTMLInputElement>('[data-testid="offline-target-search"]')
+      input.element.focus()
+      await input.setValue('H')
+      await vi.advanceTimersByTimeAsync(151)
+      expect(input.element.matches(':disabled')).toBe(false)
+      expect(document.activeElement).toBe(input.element)
+      await input.setValue('HPM5301')
+      finish([{ part_number: 'HPM5300', vendor: 'HPMicro' }])
+      await flushPromises()
+      expect(input.element.value).toBe('HPM5301')
+      expect(document.activeElement).toBe(input.element)
+      expect(wrapper.find('[data-testid="offline-probe"]').exists()).toBe(false)
+    } finally { wrapper.unmount(); vi.useRealTimers() }
+  })
+  it('shares one chip, probe model and protocol between image and option-byte tabs', async () => {
+    onlineMocks.searchTargets.mockResolvedValue([{ part_number: 'STM32F103RC', vendor: 'ST', installed: true }])
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+    await wrapper.get('.target-result').trigger('click')
+    await flushPromises()
+    const sidebar = wrapper.get('[data-testid="offline-shared-device"]')
+    expect(sidebar.text()).toContain('STM32F103RC')
+    await wrapper.get('[data-testid="offline-configuration-tab"]').trigger('click')
+    await flushPromises()
+    expect(sidebar.isVisible()).toBe(true)
+    expect(wrapper.findAll('[data-testid="offline-model"]')).toHaveLength(1)
+    expect(wrapper.findAll('[data-testid="offline-target-search"]')).toHaveLength(1)
+    expect(wrapper.findAll('[data-testid="offline-protocol"]')).toHaveLength(1)
+    expect(wrapper.getComponent(DeviceConfigurationPanel).props()).toMatchObject({ model: 'V4', partNumber: 'STM32F103RC' })
+    wrapper.getComponent(DeviceConfigurationPanel).vm.$emit('update:changes', { DATA0: '0x5A' })
+    expect(wrapper.get('[data-testid="offline-deploy"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="offline-unlock"]').element.closest('#offline-image-panel')).toBeNull()
+    expect(wrapper.get('.production-panel').attributes('style') || '').not.toContain('display: none')
+    await wrapper.get('[data-testid="offline-image-tab"]').trigger('click')
+    await wrapper.get('[data-testid="offline-configuration-tab"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.getComponent(DeviceConfigurationPanel).props('changes')).toEqual({ DATA0: '0x5A' })
+    wrapper.unmount()
+  })
+  it('deploys image and confirmed UART OTP together without direct programming', async () => {
+    onlineMocks.searchTargets.mockResolvedValue([{ part_number: 'HPM5301', vendor: 'HPMicro', installed: true, source: 'builtin' }])
+    offlineMocks.getStatus.mockResolvedValue({ available: true, disk_path: 'G:/' })
+    const wrapper = mount(OfflineFlashView, { global: { stubs: { teleport: true } } })
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+    await wrapper.get('.target-result').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-protocol"]').setValue('hpm_rom_isp_uart')
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ part_number: 'HPM5301', chip_id: 0x11705142,
+      capability: 'profile_v1', rom_version: 1, soc_revision: 2, hard_lock: 0, source: 'rom_otp', read_at: 'now', words: [{ word: 69, current: 5, shadow: null, locked: null }] }) } as Response)
+    await wrapper.get('[data-testid="offline-configuration-tab"]').trigger('click'); await flushPromises()
+    await wrapper.get('[data-testid="isp-otp-write-view"]').trigger('click')
+    await wrapper.get('[data-testid="isp-otp-add"]').trigger('click')
+    await wrapper.get('[aria-label="OTP word values"]').setValue('00000007')
+    await wrapper.get('form').trigger('submit')
+    const input = wrapper.get('[data-testid="offline-firmware-input"]')
+    Object.defineProperty(input.element, 'files', { configurable: true, value: [new File(['bin'], 'firmware.bin')] })
+    await input.trigger('change')
+    expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="isp-otp-deploy-confirm"]').setValue(true)
+    await wrapper.get('[data-testid="offline-image-tab"]').trigger('click')
+    expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('[data-testid="offline-deploy"]').trigger('click'); await flushPromises()
+    expect(offlineMocks.deploy).toHaveBeenCalledOnce()
+    const payload = offlineMocks.deploy.mock.calls[0][0]
+    expect(payload.firmwares).toHaveLength(1)
+    expect(payload.hpm_isp_otp).toEqual({ target_identity: { chip_id: 0x11705142, rom_version: 1, soc_revision: 2 },
+      words: [{ word: 69, expected: 5, desired: 7 }], confirm_irreversible: true })
+    expect(wrapper.find('[data-testid="isp-otp-program"]').exists()).toBe(false)
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/hpm-isp-otp/batch-program'))).toHaveLength(0)
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('/device/connect'))).toBe(false)
+    wrapper.unmount()
+  })
+  it('reads UART OTP without a BIN or SD, and discards stale data after a protocol change', async () => {
+    onlineMocks.searchTargets.mockResolvedValue([{ part_number: 'HPM5301xEGx', vendor: 'HPMicro', installed: true, source: 'builtin' }])
+    offlineMocks.getStatus.mockResolvedValue({ available: false })
+    const wrapper = mount(OfflineFlashView, { global: { stubs: { teleport: true } } })
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+    await wrapper.get('.target-result').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-protocol"]').setValue('hpm_rom_isp_uart')
+    const snapshot = { part_number: 'HPM5301XEGX', chip_id: 0x11705142, hard_lock: 0, read_at: 'now', source: 'rom',
+      words: [{ word: 69, current: 123, shadow: null, locked: null }] }
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => snapshot } as Response)
+    await wrapper.get('[data-testid="offline-configuration-tab"]').trigger('click')
+    await flushPromises()
+    const [url, init] = vi.mocked(fetch).mock.lastCall!
+    expect(String(url)).toContain('/hpm-isp-otp/read')
+    expect(JSON.parse(init!.body as string)).toEqual({ part_number: 'HPM5301XEGX', model: 'V4', extended: true })
+    expect(wrapper.get('[data-testid="hpm-isp-otp"]').text()).toContain('0x0000007B')
+    expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="hpm-isp-otp"]').find('dialog').exists()).toBe(false)
+    let finish!: (value: Response) => void
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    await wrapper.get('[data-testid="isp-otp-read"]').trigger('click')
+    expect(wrapper.get('[data-testid="hpm-isp-otp"]').text()).not.toContain('0x0000007B')
+    expect(wrapper.get('[data-testid="isp-otp-read"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="offline-protocol"]').setValue('debug')
+    finish({ ok: true, json: async () => snapshot } as Response)
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-image-tab"]').trigger('click')
+    await wrapper.get('[data-testid="offline-protocol"]').setValue('hpm_rom_isp_uart')
+    expect(wrapper.get('[data-testid="offline-image-tab"]').attributes('aria-selected')).toBe('true')
+    expect(wrapper.get('#offline-configuration-panel').attributes('style')).toContain('display: none')
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('/device/connect'))).toBe(false)
+    wrapper.unmount()
+  })
   it('adopts online chip defaults and refreshes imported targets without a device connection', async () => {
     onlineMocks.searchTargets.mockImplementation(async (part: string) => [{ part_number: part, installed: true, vendor: 'Fixture' }])
     publishOnlineTarget('STM32F103RC')
@@ -127,7 +361,7 @@ describe('OfflineFlashView', () => {
     expect(route?.path).toBe('/offline-flash')
   })
 
-  it('requires a manual model selection and forces the V2/V3 script name', async () => {
+  it('allows manual selection when detection is unavailable and forces the V2/V3 script name', async () => {
     const wrapper = mount(OfflineFlashView)
     await flushPromises()
 
@@ -139,6 +373,110 @@ describe('OfflineFlashView', () => {
     expect(wrapper.get('[data-testid="offline-script-name"]').attributes('disabled')).toBeDefined()
     expect(wrapper.find('option[value="auto"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeDefined()
+  })
+
+  it.each(['V2', 'V3', 'V4'])('detects %s from the connected probe instead of a saved model', async model => {
+    localStorage.setItem('mklink.offlineFlash.settings', JSON.stringify({ model: 'V3' }))
+    offlineMocks.getStatus.mockResolvedValue({ available: true, probe_id: 'probe-a', model, version: `${model}.9.1` })
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    expect(wrapper.get('[data-testid="offline-model"]').element).toHaveProperty('value', model)
+    expect(wrapper.get('[data-testid="offline-model"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="offline-detected-model"]').text()).toContain(`${model}.9.1`)
+    expect(offlineMocks.deploy).not.toHaveBeenCalled()
+    expect(offlineMocks.trigger).not.toHaveBeenCalled()
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => /runtime\/select|device\/connect/.test(String(url)))).toBe(false)
+  })
+
+  it('detects a newly inserted probe and clears its inferred model after unplugging', async () => {
+    vi.useFakeTimers()
+    const wrapper = mount(OfflineFlashView)
+    try {
+      await flushPromises()
+      offlineMocks.getStatus.mockResolvedValue({ available: true, probe_id: 'probe-a', model: 'V4', version: 'V4.7.1' })
+      await vi.advanceTimersByTimeAsync(3000)
+      await flushPromises()
+      expect(wrapper.get('[data-testid="offline-model"]').element).toHaveProperty('value', 'V4')
+      offlineMocks.getStatus.mockResolvedValue({ available: false, probes: [] })
+      await vi.advanceTimersByTimeAsync(3000)
+      await flushPromises()
+      expect(wrapper.get('[data-testid="offline-model"]').element).toHaveProperty('value', '')
+      expect(wrapper.get('[data-testid="offline-model"]').attributes('disabled')).toBeUndefined()
+      expect(wrapper.find('[data-testid="offline-detected-model"]').exists()).toBe(false)
+      wrapper.unmount()
+      const calls = offlineMocks.getStatus.mock.calls.length
+      await vi.advanceTimersByTimeAsync(9000)
+      expect(offlineMocks.getStatus).toHaveBeenCalledTimes(calls)
+    } finally { wrapper.unmount(); vi.useRealTimers() }
+  })
+
+  it('requires an explicit choice among multiple probes and reads only that choice', async () => {
+    const probes = [{ probe_id: 'a', port: 'COM1', alias: 'Bench A' }, { probe_id: 'b', port: 'COM2', alias: 'Bench B' }]
+    offlineMocks.getStatus.mockImplementation(async probe => probe === 'b'
+      ? { available: true, probes, probe_id: 'b', model: 'V2', version: 'V2.9.2' }
+      : { available: false, probes })
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    expect(wrapper.get('[data-testid="offline-model"]').element).toHaveProperty('value', '')
+    await wrapper.get('[data-testid="offline-probe"]').setValue('b')
+    await flushPromises()
+    expect(offlineMocks.getStatus).toHaveBeenLastCalledWith('b')
+    expect(wrapper.get('[data-testid="offline-model"]').element).toHaveProperty('value', 'V2')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="offline-script-name"]').element.value).toBe('offline_download.py')
+  })
+
+  it('re-detects a unique replacement when the explicitly selected probe disappears', async () => {
+    const probes = [{ probe_id: 'a', port: 'COM1' }, { probe_id: 'b', port: 'COM2' }]
+    offlineMocks.getStatus.mockResolvedValue({ available: false, probes })
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    offlineMocks.getStatus.mockResolvedValue({ available: true, probes, probe_id: 'b', model: 'V2' })
+    await wrapper.get('[data-testid="offline-probe"]').setValue('b')
+    await flushPromises()
+    const replacement = [{ probe_id: 'a', port: 'COM1' }]
+    offlineMocks.getStatus.mockResolvedValueOnce({ available: false, probes: replacement })
+      .mockResolvedValueOnce({ available: true, probes: replacement, probe_id: 'a', model: 'V4' })
+    await wrapper.get('[data-testid="offline-refresh-probe"]').trigger('click')
+    await flushPromises()
+    expect(offlineMocks.getStatus).toHaveBeenLastCalledWith()
+    expect(wrapper.get('[data-testid="offline-model"]').element).toHaveProperty('value', 'V4')
+    expect(wrapper.find('[data-testid="offline-probe"]').exists()).toBe(false)
+  })
+
+  it('discards stale discovery after navigation and resumes only one polling loop', async () => {
+    vi.useFakeTimers()
+    let finish!: (value: unknown) => void
+    offlineMocks.getStatus.mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+    const active = ref(true)
+    const wrapper = mount({ render: () => h(KeepAlive, null, { default: () => active.value ? h(OfflineFlashView) : h('div') }) })
+    try {
+      await flushPromises()
+      active.value = false
+      await flushPromises()
+      active.value = true
+      await flushPromises()
+      finish({ available: true, model: 'V2', version: 'V2.9.2' })
+      await flushPromises()
+      expect(wrapper.get('[data-testid="offline-model"]').element).toHaveProperty('value', '')
+      offlineMocks.getStatus.mockResolvedValue({ available: true, model: 'V4', version: 'V4.7.1' })
+      await vi.advanceTimersByTimeAsync(3000)
+      await flushPromises()
+      expect(offlineMocks.getStatus).toHaveBeenCalledTimes(2)
+      expect(wrapper.get('[data-testid="offline-model"]').element).toHaveProperty('value', 'V4')
+    } finally { wrapper.unmount(); vi.useRealTimers() }
+  })
+
+  it('recovers discovery after a temporary error without leaving a blocking alert', async () => {
+    offlineMocks.getStatus.mockRejectedValueOnce(Error('USB temporarily unavailable'))
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    expect(wrapper.get('[data-testid="offline-probe-reason"]').text()).toContain('USB temporarily unavailable')
+    offlineMocks.getStatus.mockResolvedValue({ available: true, model: 'V4', version: 'V4.7.1' })
+    await wrapper.get('[data-testid="offline-refresh-probe"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="offline-probe-reason"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="offline-error"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="offline-model"]').element).toHaveProperty('value', 'V4')
   })
 
   it('keeps high clocks available when switching from V3 to updated V2', async () => {
@@ -164,9 +502,9 @@ describe('OfflineFlashView', () => {
     expect(source).toContain('v-model="item.flash_base"')
     expect(source).toContain('v-model="item.ram_base"')
     expect(source).toContain('自动烧录次数')
-    expect(source).toContain('SWD 速率')
+    expect(source).toContain('调试速率')
     expect(source).toContain('添加本地 FLM')
-    expect(source).toContain('建议流程')
+    expect(source).toContain('offline-shared-device')
   })
 
   it('previews and deploys option-only changes without firmware, then clears them on model change', async () => {
@@ -174,7 +512,10 @@ describe('OfflineFlashView', () => {
     await flushPromises()
     await wrapper.get('[data-testid="offline-model"]').setValue('V4')
     await flushPromises()
+    await wrapper.get('[data-testid="offline-configuration-tab"]').trigger('click')
+    await flushPromises()
     wrapper.getComponent(DeviceConfigurationPanel).vm.$emit('update:changes', { DATA0: '0x5A' })
+    await wrapper.get('[data-testid="offline-image-tab"]').trigger('click')
     await flushPromises()
     await wrapper.get('[data-testid="offline-deploy"]').trigger('click')
     await flushPromises()
@@ -459,7 +800,7 @@ describe('OfflineFlashView', () => {
       'V4',
       'factory-download.py',
       expect.any(Function),
-      undefined, {},
+      undefined, {}, undefined,
     )
 
     await wrapper.get('[data-testid="offline-model"]').setValue('V3')
@@ -522,6 +863,7 @@ describe('OfflineFlashView', () => {
       source_token: null, origin: 'MCU profile', available: true, on_probe: true,
     }])
     offlineMocks.deploy.mockRejectedValueOnce(new Error('response lost'))
+    offlineMocks.deploymentStatus.mockRejectedValueOnce(new Error('connection unavailable'))
     const wrapper = mount(OfflineFlashView)
     await flushPromises()
     await wrapper.get('[data-testid="offline-model"]').setValue('V4')
@@ -538,25 +880,29 @@ describe('OfflineFlashView', () => {
     await flushPromises()
 
     expect(offlineMocks.deploy).toHaveBeenCalledOnce()
-    const id = wrapper.get<HTMLInputElement>('[data-testid="deployment-request-id"]').element.value
-    expect(id).toBe(offlineMocks.deploy.mock.calls[0][3])
+    const id = offlineMocks.deploy.mock.calls[0][3]
+    expect(id).toBeTruthy()
+    expect(wrapper.find('[data-testid="deployment-request-id"]').exists()).toBe(false)
+    expect(offlineMocks.deploymentStatus).toHaveBeenCalledExactlyOnceWith(id)
     expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeDefined()
     offlineMocks.deploymentStatus.mockResolvedValue({ state: 'succeeded', result: {
       status: 'deployed', model: 'V4', script_name: 'factory-download.py', files: ['app.hex'],
     } })
     await wrapper.get('[data-testid="deployment-query"]').trigger('click')
     await flushPromises()
-    expect(offlineMocks.deploymentStatus).toHaveBeenCalledExactlyOnceWith(id)
+    expect(offlineMocks.deploymentStatus).toHaveBeenLastCalledWith(id)
     expect(offlineMocks.deploy).toHaveBeenCalledOnce()
-    expect(wrapper.text()).toContain('已查询到部署成功记录')
+    expect(wrapper.text()).toContain('部署成功')
+    expect(wrapper.find('[data-testid="deployment-query"]').exists()).toBe(false)
+    offlineMocks.deploy.mockRejectedValueOnce(new Error('response lost again'))
     offlineMocks.deploymentStatus.mockRejectedValueOnce(new Error('No retained deployment'))
-    await wrapper.get('[data-testid="deployment-request-id"]').setValue('missing-request')
-    await wrapper.get('[data-testid="deployment-query"]').trigger('click')
+    await wrapper.get('[data-testid="offline-deploy"]').trigger('click')
     await flushPromises()
-    expect(wrapper.text()).toContain('No retained deployment')
-    expect(wrapper.text()).not.toContain('已查询到部署成功记录')
+    expect(wrapper.text()).toContain('response lost again')
+    expect(wrapper.text()).not.toContain('部署成功')
     expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeDefined()
-    expect(offlineMocks.deploy).toHaveBeenCalledOnce()
+    expect(offlineMocks.deploy).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
   })
 
   it('confirms security choices immediately and sends the validated V3 recipe', async () => {
@@ -712,6 +1058,174 @@ describe('OfflineFlashView', () => {
 
     expect(wrapper.get('.trigger-log').text()).toContain('erase started')
     expect(wrapper.get('.trigger-log').text()).toContain('program finished')
+  })
+
+  it.each(['HPM5301xEGx', 'HPM5300', 'HPM5E31', 'HPM6280', 'HPM6E80', 'HPM6750', 'HPM6880', 'HPM6P81'])('previews and deploys %s ISP images with offset addresses and voltage presets', async part => {
+    onlineMocks.searchTargets.mockResolvedValue([{
+      part_number: part, vendor: 'HPMicro', installed: true, source: 'builtin',
+    }])
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-model"]').setValue('V4')
+    await wrapper.get('.target-result').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-protocol"]').setValue('hpm_rom_isp_uart')
+    expect(wrapper.get('option[value="hpm_rom_isp_uart"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('[data-testid="trigger-output"]').exists()).toBe(false)
+    expect(wrapper.get('.script-preview').text()).toContain('等待生成配置')
+    await wrapper.get('[data-testid="isp-beep-duration"]').setValue(275)
+    expect(wrapper.find('[data-testid="offline-clock"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('IDCODE 超时')
+    expect(wrapper.text()).toContain('ROM 自动擦除并内部校验')
+    expect(wrapper.findComponent(DeviceConfigurationPanel).exists()).toBe(false)
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="isp-baud-rate"]').element.value).toBe('2000000')
+    expect(wrapper.findAll('[data-testid="isp-baud-rate"] option').map(option => option.attributes('value')))
+      .toEqual(['115200', '1000000', '2000000', '5000000', '10000000'])
+    await wrapper.get('[data-testid="isp-baud-rate"]').setValue('10000000')
+    expect(wrapper.text()).not.toContain('给目标重新上电恢复默认速率')
+    expect(wrapper.text()).not.toContain('档位依据下载器')
+    expect(wrapper.find('[data-testid="isp-flash-size"]').exists()).toBe(false)
+    expect(wrapper.findAll('[data-testid="isp-reset"] option').map(option => option.attributes('value')))
+      .toEqual(['none', 'software', 'power_cycle'])
+    const input = wrapper.get('input[type="file"][multiple]')
+    Object.defineProperty(input.element, 'files', {
+      configurable: true, value: [new File(['a'], 'MicroLink.bin'), new File(['b'], 'MicroLink.bin')],
+    })
+    await input.trigger('change')
+    const rows = wrapper.findAll('[data-testid="offline-firmware-row"]')
+    expect(rows).toHaveLength(2)
+    expect(rows[0].get<HTMLInputElement>('input[placeholder="BIN 基地址"]').element.value).toBe('0x80000400')
+    await rows[1].get('input[placeholder="BIN 基地址"]').setValue('0x80010400')
+    expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeUndefined()
+    await wrapper.findAll('button').find(button => button.text() === '生成预览')!.trigger('click')
+    await flushPromises()
+    expect(offlineMocks.preview).toHaveBeenCalledOnce()
+    await wrapper.get('[data-testid="isp-reset"]').setValue('power_cycle')
+    expect(wrapper.text()).toContain('断电持续时间（ms）')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="isp-voltage-3300"]').element.checked).toBe(true)
+    expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('[data-testid="isp-voltage-1800"]').setValue(true)
+    await wrapper.findAll('button').find(button => button.text() === '生成预览')!.trigger('click')
+    await flushPromises()
+    expect(offlineMocks.preview.mock.lastCall![0].hpm_isp.completion.restore_voltage_mv).toBe(1800)
+    await wrapper.get('[data-testid="isp-voltage-5000"]').setValue(true)
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('确定选择 5V')
+    await wrapper.get('[data-testid="confirmation-cancel"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get<HTMLInputElement>('[data-testid="isp-voltage-1800"]').element.checked).toBe(true)
+    await wrapper.get('[data-testid="isp-voltage-5000"]').setValue(true)
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '生成预览')!.trigger('click')
+    await flushPromises()
+    expect(offlineMocks.preview.mock.lastCall![0].hpm_isp.completion.restore_voltage_mv).toBe(5000)
+    await wrapper.get('[data-testid="isp-reset"]').setValue('software')
+    expect(wrapper.text()).not.toContain('断电持续时间（ms）')
+    await wrapper.findAll('button').find(button => button.text() === '生成预览')!.trigger('click')
+    await flushPromises()
+    expect(offlineMocks.preview.mock.lastCall![0].hpm_isp.completion.restore_voltage_mv).toBeNull()
+    await wrapper.get('[data-testid="isp-reset"]').setValue('power_cycle')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="isp-voltage-3300"]').element.checked).toBe(true)
+    const count = wrapper.findAll('label').find(label => label.text().includes('自动烧录次数'))!
+    await count.get('input').setValue('10')
+    expect(wrapper.find('[data-testid="isp-confirm-cycles"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('等待目标退出 ISP')
+    expect(wrapper.get('[data-testid="offline-deploy"]').attributes('disabled')).toBeUndefined()
+    const previewButton = wrapper.findAll('button').find(button => button.text() === '生成预览')!
+    expect(previewButton.attributes('disabled')).toBeUndefined()
+    await previewButton.trigger('click')
+    await flushPromises()
+    expect(offlineMocks.preview.mock.lastCall![0].auto_download_count).toBe(10)
+    await wrapper.get('[data-testid="offline-deploy"]').trigger('click')
+    await flushPromises()
+    const config = offlineMocks.deploy.mock.calls[0][0]
+    expect(config.programming_protocol).toBe('hpm_rom_isp_uart')
+    expect(config.target_part).toBe(part)
+    expect(config.board).toBeNull()
+    expect(config.hpm_isp.flash_size).toBeUndefined()
+    expect(config.hpm_isp.baud_rate).toBe(10000000)
+    expect(config.hpm_isp.nor_options).toEqual(['0xFCF90002', '0x6', '0x1000'])
+    expect(config.hpm_isp.completion.restore_voltage_mv).toBe(3300)
+    expect(config.hpm_isp.completion.beep_duration_ms).toBe(275)
+    expect(wrapper.find('[data-testid="trigger-output"]').exists()).toBe(false)
+    const previewText = wrapper.get('.script-preview').text()
+    expect(config.auto_download_count).toBe(10)
+    expect(config.hpm_isp.rearm_mode).toBe('isp_reconnect')
+    expect(config.hpm_isp.confirm_reconnect_cycles).toBeUndefined()
+    expect(config.firmwares.map((f: { base_address: string }) => f.base_address)).toEqual(['0x80000400', '0x80010400'])
+    expect(config.firmwares.map((f: { file_name: string }) => f.file_name)).toEqual(['MicroLink.bin', 'MicroLink-2.bin'])
+    let finish!: (value: { status: string; lines: string[] }) => void
+    offlineMocks.trigger.mockImplementationOnce((_model, _name, onLine) => {
+      onLine('import hpm')
+      onLine('HPM_ISP {"schema":1,"event":"waiting","cycle":1,"total":10}')
+      onLine('HPM_ISP {"schema":1,"event":"connected"}')
+      return new Promise(resolve => { finish = resolve })
+    })
+    await wrapper.get('[data-testid="offline-trigger"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('恢复 3.3V')
+    expect(offlineMocks.trigger).not.toHaveBeenCalled()
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="isp-connection"]').text()).toContain('ISP 已连接')
+    expect(wrapper.get('.script-preview').text()).toBe(previewText)
+    expect(wrapper.get('.run-workspace').classes()).toContain('has-run-output')
+    expect(wrapper.get('[data-testid="trigger-output"]').element.parentElement).toBe(wrapper.get('.script-preview').element.parentElement)
+    expect(wrapper.get('.trigger-log').text()).toBe('ISP waiting 1/10\nISP connected')
+    expect(wrapper.get('.trigger-log').text()).not.toContain('import hpm')
+    offlineMocks.trigger.mock.lastCall![2]('HPM_ISP {"schema":1,"event":"cycle_done","completed":1,"total":10}')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="isp-connection"]').text()).toContain('已连接 · 本轮烧录完成')
+    offlineMocks.trigger.mock.lastCall![2]('HPM_ISP {"schema":1,"event":"disconnected"}')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="isp-connection"]').text()).toContain('等待 ISP 握手')
+    finish({ status: 'unknown', lines: [] })
+    await flushPromises()
+    expect(wrapper.get('.trigger-log').text()).toContain('ISP connected')
+    expect(wrapper.text()).toContain('运行结果未确认')
+    expect(wrapper.get('[data-testid="offline-trigger"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="offline-protocol"]').setValue('debug')
+    expect(wrapper.find('[data-testid="hpm-isp-settings"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="offline-clock"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="offline-trigger"]').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  it('persists and restores the selected ISP baud preset', async () => {
+    onlineMocks.searchTargets.mockResolvedValue([{
+      part_number: 'HPM5301', vendor: 'HPMicro', installed: true, source: 'builtin',
+    }])
+    localStorage.setItem('mklink.offlineFlash.settings', JSON.stringify({ model: 'V4', ispBaudRate: 5000000 }))
+    async function openIsp() {
+      const wrapper = mount(OfflineFlashView)
+      await flushPromises()
+      await wrapper.get('.target-result').trigger('click')
+      await flushPromises()
+      await wrapper.get('[data-testid="offline-protocol"]').setValue('hpm_rom_isp_uart')
+      return wrapper
+    }
+    let wrapper = await openIsp()
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="isp-baud-rate"]').element.value).toBe('5000000')
+    await wrapper.get('[data-testid="isp-baud-rate"]').setValue('10000000')
+    expect(JSON.parse(localStorage.getItem('mklink.offlineFlash.settings')!).ispBaudRate).toBe(10000000)
+    wrapper.unmount()
+    wrapper = await openIsp()
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="isp-baud-rate"]').element.value).toBe('10000000')
+    wrapper.unmount()
+  })
+
+  it.each([0, -1, 1.5, 4294967296, '2M', null, 3456789, 4000000, 12500000])('uses the 2M default for invalid saved ISP baud %s', async savedBaud => {
+    localStorage.setItem('mklink.offlineFlash.settings', JSON.stringify({ model: 'V4', ispBaudRate: savedBaud }))
+    onlineMocks.searchTargets.mockResolvedValue([{
+      part_number: 'HPM5301', vendor: 'HPMicro', installed: true, source: 'builtin',
+    }])
+    const wrapper = mount(OfflineFlashView)
+    await flushPromises()
+    await wrapper.get('.target-result').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="offline-protocol"]').setValue('hpm_rom_isp_uart')
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="isp-baud-rate"]').element.value).toBe('2000000')
+    wrapper.unmount()
   })
 
   it.each(['bin', 'hex'])('configures HPM %s download without Pack or FLM algorithms', async (format) => {

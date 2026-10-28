@@ -1,6 +1,7 @@
 import importlib.util
 import hashlib
 import json
+import re
 from pathlib import Path
 import tomllib
 from zipfile import ZipFile
@@ -47,6 +48,9 @@ def builder(monkeypatch, tmp_path):
         prepare_bundle=lambda _: tmp_path / "builtin_packs",
         validate_bundle=lambda _: {"svd_target_count": 1},
     ))
+    support = tmp_path / "build-work/pyinstaller/dist/mklink-sidecar/_internal"
+    support.mkdir(parents=True)
+    (support / "base_library.zip").write_bytes(b"stdlib")
     return module
 
 
@@ -89,6 +93,19 @@ def test_local_bundle_disables_updater_artifacts_and_restores_config(builder, tm
     config.write_bytes(original)
     with builder.temporary_bundle_config(config, signed=False):
         assert json.loads(config.read_text())["bundle"]["createUpdaterArtifacts"] is False
+    assert config.read_bytes() == original
+
+
+def test_preview_bundle_preserves_fallbacks_and_restores_stable_config(builder, tmp_path):
+    config = tmp_path / "tauri.conf.json"
+    original = (PROJECT_ROOT / "gui/src-tauri/tauri.conf.json").read_bytes()
+    config.write_bytes(original)
+    with pytest.raises(RuntimeError, match="build failed"):
+        with builder.temporary_bundle_config(config, preview_updates=True):
+            endpoints = json.loads(config.read_text())["plugins"]["updater"]["endpoints"]
+            assert endpoints[0] == "https://download.microkeenai.com/mklink/preview/latest.json"
+            assert endpoints[1:] == json.loads(original)["plugins"]["updater"]["endpoints"][1:]
+            raise RuntimeError("build failed")
     assert config.read_bytes() == original
 
 
@@ -228,14 +245,15 @@ def test_sidecar_uses_managed_pyinstaller_work_paths(builder, tmp_path, monkeypa
 
     def fake_run(command, **_kwargs):
         calls.append(command)
-        output = Path(command[command.index("--distpath") + 1])
-        output.mkdir(parents=True)
+        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar"
+        output.mkdir(parents=True, exist_ok=True)
         (output / "mklink-sidecar.exe").write_bytes(b"sidecar")
         return 0
 
     monkeypatch.setattr(builder, "run", fake_run)
 
     assert builder.build_sidecar(force=True)
+    assert "--onedir" in calls[0] and "--onefile" not in calls[0]
     for option in ("--distpath", "--workpath", "--specpath"):
         assert Path(calls[0][calls[0].index(option) + 1]).is_relative_to(
             tmp_path / "build-work"
@@ -443,7 +461,7 @@ def test_tauri_bundle_integrates_mklink_usb_port_naming():
     assert "$INSTDIR\\${MAINBINARYNAME}.exe" not in protocol_block
 
 
-def test_stable_product_version_and_signed_updater_are_configured():
+def test_product_version_and_signed_updater_are_configured():
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     cargo = (PROJECT_ROOT / "gui" / "src-tauri" / "Cargo.toml").read_text(
         encoding="utf-8"
@@ -472,10 +490,12 @@ def test_stable_product_version_and_signed_updater_are_configured():
     python_version = tomllib.loads(pyproject)["project"]["version"]
     cargo_version = tomllib.loads(cargo)["package"]["version"]
     assert python_version == cargo_version == config["version"]
-    assert len(config["version"].split(".")) == 3
-    assert all(part.isdigit() for part in config["version"].split("."))
+    # Local test installers may carry rc.N; the tracked signing and stable
+    # channel configuration below must still remain enabled and unchanged.
+    assert re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-rc\.[1-9]\d*)?", config["version"])
     assert config["bundle"]["createUpdaterArtifacts"] is True
     assert config["plugins"]["updater"]["endpoints"] == [
+        "https://download.microkeenai.com/mklink/stable/latest.json",
         "https://raw.githubusercontent.com/MicroKeen/Mklink-AI-Probe/release/latest.json",
         GITEE_UPDATER_ENDPOINT,
     ]
@@ -498,7 +518,7 @@ def test_sidecar_collects_pyocd_plugins_metadata_and_hid_binary(builder, monkeyp
 
     def fake_run(command, **_kwargs):
         commands.append(command)
-        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar.exe"
+        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar" / "mklink-sidecar.exe"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"sidecar")
         return 0
@@ -995,13 +1015,13 @@ def test_sidecar_collects_generated_builtin_pack_bundle(builder, monkeypatch, tm
 
     def fake_bundle(_config, roots, output):
         generated.append((list(roots), output))
-        output.mkdir(parents=True)
+        output.mkdir(parents=True, exist_ok=True)
         (output / "manifest.json").write_text('{"schema":1,"packs":[]}', encoding="utf-8")
         return {"target_count": 0, "packs": []}
 
     def fake_run(command, **_kwargs):
         commands.append(command)
-        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar.exe"
+        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar" / "mklink-sidecar.exe"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"sidecar")
         return 0
@@ -1029,7 +1049,7 @@ def test_sidecar_collects_local_builtin_flm_bundle(
 
     def fake_run(command, **_kwargs):
         commands.append(command)
-        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar.exe"
+        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar" / "mklink-sidecar.exe"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"sidecar")
         return 0
@@ -1109,8 +1129,8 @@ def test_sidecar_includes_web_assets_at_frozen_api_path(builder, monkeypatch, tm
         pairs = list(zip(command, command[1:]))
         assert ("--add-data", str(dist) + builder.os.pathsep + "gui/dist") in pairs
         calls.append("freeze")
-        output = Path(command[command.index("--distpath") + 1])
-        output.mkdir(parents=True)
+        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar"
+        output.mkdir(parents=True, exist_ok=True)
         (output / "mklink-sidecar.exe").write_bytes(b"sidecar")
         return 0
     monkeypatch.setattr(builder, "build_web_assets", frontend)
@@ -1144,3 +1164,23 @@ def test_failed_frontend_prevents_sidecar_freeze(builder, monkeypatch, tmp_path)
     monkeypatch.setattr(builder, "build_web_assets", fail)
     with pytest.raises(SystemExit):
         builder.build_sidecar(force=True)
+
+
+def test_windows_bundle_installs_dependencies_beside_sidecar(builder, tmp_path):
+    bundle = {"resources": {"notice.txt": "notice.txt"}}
+    builder.add_stcp_bundle_resource(bundle)
+    support = tmp_path / "build-work/pyinstaller/dist/mklink-sidecar/_internal"
+    (support / "nested").mkdir()
+    (support / "nested/data.bin").write_bytes(b"asset")
+    with builder.temporary_sidecar_resources(bundle, tmp_path):
+        resource = next(key for key, value in bundle["resources"].items() if value == "_internal")
+        assert not Path(resource).is_absolute()
+        staged = tmp_path / resource
+        assert (staged / "base_library.zip").read_bytes() == b"stdlib"
+        assert (staged / "nested/data.bin").read_bytes() == b"asset"
+        assert bundle["resources"]["notice.txt"] == "notice.txt"
+    assert not staged.exists()
+    (support / "base_library.zip").unlink()
+    with pytest.raises(RuntimeError, match="dependency directory is missing"):
+        with builder.temporary_sidecar_resources(bundle, tmp_path):
+            pass

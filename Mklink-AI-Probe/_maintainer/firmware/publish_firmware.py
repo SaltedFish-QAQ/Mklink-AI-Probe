@@ -28,9 +28,11 @@ from mklink.firmware_check import (  # noqa: E402
     Version,
     parse_firmware_filename,
     validate_uf2,
+    bundled_firmwares,
 )
 from _maintainer.release.publish_update_release import (  # noqa: E402
     _asset_url,
+    github_channels,
     _gitee_push,
     _run,
     ensure_gitee_release,
@@ -80,6 +82,11 @@ def scan_firmware_directory(root: Path) -> dict[tuple[str, str], dict[str, objec
             "uf2_blocks": blocks,
             "path": path,
         }
+        pinned = next((item for item in bundled_firmwares() if item.name == path.name), None)
+        if pinned is not None:
+            if pinned.sha256 != entry['sha256'] or pinned.size != entry['size']:
+                raise ValueError(f'firmware differs from pinned delivery: {path.name}')
+            entry['build_id'] = pinned.build_id
         key = (info.family, info.model)
         previous = selected.get(key)
         if previous is None or info.version > _version(str(previous["version"])):
@@ -99,6 +106,7 @@ def _public_entry(entry: Mapping[str, object], urls: Mapping[str, str]) -> dict[
         "sha256": entry["sha256"],
         "uf2_blocks": entry["uf2_blocks"],
         "urls": dict(urls),
+        **({'build_id': entry['build_id']} if entry.get('build_id') else {}),
     }
 
 
@@ -294,6 +302,7 @@ def publish_firmware(
     *, root: Path, github_repo: str, gitee_repo: str, token: str,
     dry_run: bool = False,
 ) -> dict[str, object]:
+    github_channels(github_repo)  # Enforce the same retired-repository boundary.
     local = scan_firmware_directory(root)
     files = [Path(entry["path"]) for entry in local.values()]
     existing = load_github_manifest(github_repo)
@@ -371,7 +380,7 @@ def publish_firmware(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--firmware-dir", type=Path, default=REPOSITORY / "MK-Firmware")
-    parser.add_argument("--github-repo", default="Aladdin-Wang/Mklink-AI-Probe")
+    parser.add_argument("--github-repo", default="MicroKeen/Mklink-AI-Probe")
     parser.add_argument("--gitee-repo", default="Aladdin-Wang/Mklink-AI-Probe")
     parser.add_argument("--dry-run", action="store_true")
     return parser

@@ -71,24 +71,33 @@ if os.name=='nt':
 @pytest.mark.parametrize('closed', ['1', '2', '1,2'])
 def test_windowless_missing_descriptors_are_restored(tmp_path, closed):
     result = subprocess.run([sys.executable, '-c', r'''
-import os,sys,threading
+import os,sys,threading,traceback,json
 from pathlib import Path
 from mklink.runtime_logging import runtime_diagnostics
 closed=[int(n) for n in sys.argv[2].split(',')]
 for fd in closed: os.close(fd)
 sys.stdout=sys.stderr=None
-with runtime_diagnostics(sys.argv[1]):
-    print('windowless Python')
-    os.write(1,b'windowless native\n')
-for fd in closed:
-    try: os.fstat(fd)
-    except OSError: pass
-    else: raise AssertionError('originally closed descriptor leaked')
-assert not any(t.name=='runtime-diagnostics' for t in threading.enumerate())
-text=(Path(sys.argv[1])/'runtime.log').read_text()
-assert 'windowless Python' in text and 'windowless native' in text
+try:
+    with runtime_diagnostics(sys.argv[1]):
+        print('windowless Python')
+        os.write(1,b'windowless native\n')
+    for fd in closed:
+        try: os.fstat(fd)
+        except OSError: pass
+        else: raise AssertionError('originally closed descriptor leaked')
+    assert not any(t.name=='runtime-diagnostics' for t in threading.enumerate())
+    text=(Path(sys.argv[1])/'runtime.log').read_text(encoding='utf-8')
+    assert 'windowless Python' in text and 'windowless native' in text, repr(text)
+    assert all(line.count('[pid=') == 1 for line in text.splitlines()), repr(text)
+    events=[json.loads(line)['event'] for line in (Path(sys.argv[1])/'connection.jsonl').read_text(encoding='utf-8').splitlines()]
+    assert events == ['runtime.started','runtime.stopped'], events
+except BaseException:
+    # Both output descriptors may be absent: stderr cannot explain CI failures.
+    (Path(sys.argv[1])/'failure.txt').write_text(traceback.format_exc(),encoding='utf-8')
+    raise SystemExit(1)
 ''', str(tmp_path), closed], capture_output=True, timeout=20)
-    assert result.returncode == 0, result.stderr
+    failure = tmp_path / 'failure.txt'
+    assert result.returncode == 0, failure.read_text(encoding='utf-8') if failure.exists() else result.stderr
 
 
 def test_idle_child_cannot_hold_diagnostic_shutdown_open(tmp_path):
@@ -158,8 +167,13 @@ def test_concurrent_writers_and_separate_runtime_directories(tmp_path):
             list(pool.map(lambda n: stream.write(f'row-{n}\n'), range(300)))
     with runtime_diagnostics(second):
         print('other runtime')
-    assert sorted((first / 'runtime.log').read_text().splitlines()) == sorted(f'row-{n}' for n in range(300))
-    assert (second / 'runtime.log').read_text() == 'other runtime\n'
+    import re
+    from datetime import datetime
+    rows = (first / 'runtime.log').read_text().splitlines()
+    for row in rows:
+        assert datetime.fromisoformat(row.split(']')[0][1:]).tzinfo is not None
+    assert sorted(re.sub(r'^\[[^]]+\] \[pid=\d+\] ', '', row) for row in rows) == sorted(f'row-{n}' for n in range(300))
+    assert (second / 'runtime.log').read_text().endswith('other runtime\n')
 
 
 def test_rollover_failure_does_not_recurse_or_abort_runtime(tmp_path, monkeypatch):
@@ -167,8 +181,10 @@ def test_rollover_failure_does_not_recurse_or_abort_runtime(tmp_path, monkeypatc
     def unavailable(handler):
         raise OSError('disk unavailable')
     monkeypatch.setattr(RotatingFileHandler, 'doRollover', unavailable)
-    with runtime_diagnostics(tmp_path, max_bytes=100):
+    with runtime_diagnostics(tmp_path, max_bytes=256):
         sys.stdout.write('seed\n')
-        sys.stdout.write('x' * 200)
+        sys.stdout.write('x' * 300 + '\n')
         sys.stdout.write('runtime stays alive\n')
-    assert (tmp_path / 'runtime.log').read_text() == 'seed\nruntime stays alive\n'
+    log = (tmp_path / 'runtime.log').read_text()
+    assert 'seed\n' in log and log.endswith('runtime stays alive\n')
+    assert 'xxx' not in log

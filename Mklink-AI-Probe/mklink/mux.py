@@ -11,6 +11,7 @@ import secrets
 import struct
 import threading
 import time
+from mklink.connection_diagnostics import event, error_detail
 
 
 class MuxError(ConnectionError):
@@ -27,6 +28,14 @@ class MuxTargetError(RuntimeError):
         super().__init__(message)
 
 
+class MuxWatchEvent(bytes):
+    """Local reset generation accompanies queued wire bytes, without loss."""
+    def __new__(cls, payload, reset_generation):
+        value = super().__new__(cls, payload)
+        value.reset_generation = reset_generation
+        return value
+
+
 def packet(op, epoch, request, payload=b''):
     if len(payload) > 256:
         raise ValueError('Multiplex payload exceeds 256 bytes')
@@ -35,13 +44,16 @@ def packet(op, epoch, request, payload=b''):
 
 
 class MuxTransport:
+    SOFTWARE_RESET_CAPABILITY = 1 << 5
+    SOFTWARE_RESET_COMMAND = 0x15
     MAX_QUEUE_BYTES = 65536
     # ~160 ms at 200k 4-byte samples/s (timestamp + value). RTT queues keep
     # their original limit; replies bypass event queues. Still drop oldest on
     # sustained overload, never block the sole USB reader or command replies.
     WATCH_QUEUE_BYTES = 262144
 
-    def __init__(self, write, command_lock=None):
+    def __init__(self, write, command_lock=None, *, diagnostic_context=None):
+        self._diagnostic_context = diagnostic_context or {}
         self._write = write
         self._condition = threading.Condition()
         self._commands = command_lock or threading.RLock()
@@ -54,6 +66,7 @@ class MuxTransport:
         self.nonce = secrets.token_bytes(8)
         self.ready = False
         self.capabilities = 0
+        self._reset_generation = 0
         self.rtt_mask = 0
         self.watch_running = False
         self._last_command = time.monotonic()
@@ -74,6 +87,16 @@ class MuxTransport:
         with self._condition:
             if self._error is None:
                 self._error = MuxError(str(error))
+                now = time.monotonic()
+                event('mux.failed', **self._diagnostic_context,
+                      error=error_detail(error if isinstance(error, BaseException) else self._error),
+                      epoch=self.epoch,
+                      pending=None if self._pending is None else {
+                          'opcode': f'0x{self._pending[0]:02X}', 'request': self._pending[1],
+                          'heartbeat': self._pending[3]},
+                      last_receive_age_ms=None if self._last_receive is None else round((now-self._last_receive)*1000),
+                      last_reply_age_ms=None if self._last_reply is None else round((now-self._last_reply)*1000),
+                      timeout=self._last_timeout, rtt_mask=self.rtt_mask, watch_running=self.watch_running)
             self.ready = False
             self._condition.notify_all()
 
@@ -212,6 +235,10 @@ class MuxTransport:
                     heartbeat = self._pending[3]
                     self._last_reply = time.monotonic()
                     self._reply = payload
+                    if self._pending[0] == self.SOFTWARE_RESET_COMMAND and payload[:1] in (b'\0', b'\x05'):
+                        # Mark the boundary before subsequent events arrive.
+                        # Queued pre-reset samples keep their own generation.
+                        self._reset_generation += 1
                     self._pending = None
                     if heartbeat and payload != b'\0':
                         self.fail('Heartbeat rejected')
@@ -229,6 +256,8 @@ class MuxTransport:
                         self.event_gaps += (req-self._event_id-1) & 0xffffffff
                     self._event_id = req
                     key = (op, payload[0] if op == 0x40 else 255)
+                    if op == 0x41:
+                        payload = MuxWatchEvent(payload, self._reset_generation)
                     queue = self._queues.setdefault(key, deque())
                     size = self._sizes.get(key, 0)
                     budget = self.WATCH_QUEUE_BYTES if op == 0x41 else self.MAX_QUEUE_BYTES
@@ -289,6 +318,19 @@ class MuxTransport:
             raise ValueError('Invalid memory range')
         for offset in range(0, len(data), 128):
             self.request(0x12, struct.pack('<I', address+offset)+data[offset:offset+128])
+
+    @property
+    def supports_software_reset(self):
+        return bool(self.capabilities & self.SOFTWARE_RESET_CAPABILITY)
+
+    def software_reset(self):
+        """Reset once in the existing session; event queues remain readable."""
+        if not self.supports_software_reset:
+            raise RuntimeError('Probe firmware does not support in-stream software reset; update the probe firmware')
+        answer = self.request(self.SOFTWARE_RESET_COMMAND)
+        if answer:
+            self.fail('Invalid software reset response; outcome unknown, do not replay')
+            self._check()
 
     def close(self):
         with self._commands:

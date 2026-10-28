@@ -18,6 +18,10 @@ from .errors import FlashError, FlashErrorCode
 from .images import ImageInspector
 from .models import ImageInspection, ImageSegment, MemoryRegion
 from .pyocd_runtime import import_pyocd_attr
+from .h7_dualcore import (
+    uses_cm7_flash, install_pack_compatibility, bind_cm7, secondary_core,
+    prepare_flash as prepare_h7_flash, finish_system_reset,
+)
 
 
 _LOCKED_ERROR_PATTERN = re.compile(
@@ -919,6 +923,7 @@ class PyOcdBackend:
         self._connection_arguments: Optional[dict[str, Any]] = None
         self._py32f030_unlock_transition_pending = False
         self._nrf54l_lock_pending = False
+        self._erased_ranges: Tuple[Tuple[int, int], ...] = ()
         self._lock = threading.RLock()
 
     def connect(
@@ -1213,6 +1218,12 @@ class PyOcdBackend:
                     options["reset_type"] = "hardware"
                 if resolved_pack is not None:
                     options["pack"] = resolved_pack
+                if uses_cm7_flash(target):
+                    if resolved_pack is None:
+                        raise FlashError(FlashErrorCode.TARGET_NOT_SUPPORTED,
+                            "STM32H7 dual-core Flash requires its CMSIS-Pack CM7 configuration")
+                    install_pack_compatibility()
+                    options["primary_core"] = 0
                 session = factory(resolved_probe, options)
                 delegate = getattr(session, "delegate", None)
                 if resolved_pack is not None:
@@ -1243,6 +1254,8 @@ class PyOcdBackend:
                     session.target.dp.connect()
                 else:
                     session.open()
+                if uses_cm7_flash(target):
+                    bind_cm7(session.target)
                 core = getattr(session.target, "selected_core", None)
                 if not nrf54l_recovery_connect and core is not None and "xpsr" not in core.core_registers.by_name:
                     # pyOCD can log and swallow component initialization errors.
@@ -1313,6 +1326,7 @@ class PyOcdBackend:
         """Disable a whitelisted reversible RDP level; this mass-erases Flash."""
 
         with self._lock:
+            self._erased_ranges = ()
             try:
                 if self._security_family == "nrf54l15-ctrl-ap":
                     return self._unlock_nrf54l15()
@@ -1399,6 +1413,7 @@ class PyOcdBackend:
         """Enable a whitelisted reversible RDP level and reset to activate it."""
 
         with self._lock:
+            self._erased_ranges = ()
             try:
                 if self._security_family == "nrf54l15-ctrl-ap":
                     return self._lock_nrf54l15()
@@ -2415,6 +2430,7 @@ class PyOcdBackend:
     def disconnect(self) -> None:
         with self._lock:
             session, self._session = self._session, None
+            self._erased_ranges = ()
             self._probe_identifier = ""
             self._reset_voltage_mv = None
             self._security_family = ""
@@ -2435,6 +2451,7 @@ class PyOcdBackend:
     def erase_chip(self) -> None:
         with self._lock:
             session = self._require_session()
+            self._erased_ranges = ()
             try:
                 self._prepare_algorithm_execution(session.target)
                 factory, mode = self._eraser(erase_mode="CHIP")
@@ -2447,11 +2464,20 @@ class PyOcdBackend:
     def erase_sectors(self, addresses: Any) -> None:
         with self._lock:
             session = self._require_session()
+            self._erased_ranges = ()
             try:
                 unique = self._validated_sector_addresses(session.target, addresses)
+                ranges = tuple(
+                    (address, address + self._flash_region_for_address(
+                        session.target, address).flash.get_sector_info(address).size)
+                    for address in unique
+                )
                 self._prepare_algorithm_execution(session.target)
                 factory, mode = self._eraser(erase_mode="SECTOR")
                 factory(session, mode).erase(unique)
+                # Only a fully successful erase on this connection is reusable,
+                # and only by the immediately following program operation.
+                self._erased_ranges = ranges
             except FlashError:
                 raise
             except Exception as exc:
@@ -2464,6 +2490,7 @@ class PyOcdBackend:
     ) -> None:
         with self._lock:
             session = self._require_session()
+            erased_ranges, self._erased_ranges = self._erased_ranges, ()
             try:
                 path = Path(image.file_path)
                 if not path.is_file():
@@ -2478,11 +2505,9 @@ class PyOcdBackend:
                 self._prepare_algorithm_execution(session.target)
                 factory = self._programmer_factory
                 if factory is None:
-                    FileProgrammer = import_pyocd_attr(
-                        "pyocd.flash.file_programmer", "FileProgrammer"
-                    )
+                    from .programmer import create_programmer
 
-                    factory = FileProgrammer
+                    factory = create_programmer
                 image_start = (
                     image.base_address
                     if image.format.lower() == "bin" and image.base_address is not None
@@ -2492,6 +2517,14 @@ class PyOcdBackend:
                 # A program request only authorizes image-covered sectors, never
                 # pyOCD's automatic cost-based escalation to chip erase.
                 programmer_options: dict[str, Any] = {"chip_erase": "sector"}
+                if self._programmer_factory is None:
+                    spans = (
+                        tuple((segment.start, segment.end) for segment, _ in hex_data)
+                        if hex_data is not None else ((image_start, image_start + path.stat().st_size),)
+                    )
+                    programmer_options["already_erased"] = self._image_pages_erased(
+                        session.target, erased_ranges, spans
+                    )
                 if progress_callback is not None:
                     programmer_options["progress"] = progress_callback
                 if str(getattr(region, "name", "")).startswith("mklink_custom_flm_"):
@@ -2527,6 +2560,41 @@ class PyOcdBackend:
                 logging.getLogger(__name__).exception("Online firmware programming failed")
                 raise self._mapped_error(exc, FlashErrorCode.PROGRAM_FAIL) from None
 
+    @staticmethod
+    def _image_pages_erased(target, erased, spans) -> bool:
+        if not erased:
+            return False
+        pages = []
+        for start, end in spans:
+            address = start
+            while address < end:
+                region = PyOcdBackend._flash_region_for_address(target, address)
+                get_info = getattr(getattr(region, "flash", None), "get_page_info", None)
+                info = get_info(address) if callable(get_info) else None
+                if info is None or info.size <= 0 or not info.base_addr <= address < info.base_addr + info.size:
+                    return False
+                pages.append((info.base_addr, info.base_addr + info.size))
+                address = info.base_addr + info.size
+        return PyOcdBackend._ranges_cover(erased, pages)
+
+    @staticmethod
+    def _ranges_cover(erased, spans) -> bool:
+        """Never skip erase for a gap or an unproven part of an image."""
+        if not erased or not spans:
+            return False
+        for start, end in spans:
+            cursor = start
+            for low, high in sorted(erased):
+                if low > cursor:
+                    break
+                if high > cursor:
+                    cursor = high
+                if cursor >= end:
+                    break
+            if cursor < end:
+                return False
+        return True
+
     def _prepare_algorithm_execution(self, target: Any) -> None:
         """Reset Cortex-M targets once before destructive work.
 
@@ -2537,7 +2605,20 @@ class PyOcdBackend:
 
         if not self._algorithm_reset_required or self._algorithm_reset_done:
             return
-        target.reset_and_halt()
+        dual_h7 = uses_cm7_flash((self._connection_arguments or {}).get("target", ""))
+        if dual_h7:
+            bind_cm7(target)
+            secondary_core(target)
+            if self._reset_mode == "core":
+                raise FlashError(FlashErrorCode.CONNECT_FAIL,
+                    "STM32H7 dual-core Flash requires system or hardware reset, not core-only reset")
+            # Failed/partial Flash and program-without-reset must never resume
+            # a RAM algorithm or CM4's stale application PC during teardown.
+            self._require_session().options["resume_on_disconnect"] = False
+        if dual_h7:
+            prepare_h7_flash(target, hardware_reset=self._reset_mode == "hardware")
+        else:
+            target.reset_and_halt()
         # Some probes/targets acknowledge a software reset while retaining the
         # running RTOS context. Do not erase and then run an FLM on its PSP or
         # from an exception handler. Do not silently substitute a physical reset.
@@ -2722,6 +2803,7 @@ class PyOcdBackend:
     def reset_run(self, reset_mode: Optional[str] = None) -> None:
         with self._lock:
             session = self._require_session()
+            self._erased_ranges = ()
             trace_delegate = getattr(session, "delegate", None)
             if isinstance(trace_delegate, _TraceStateDelegate):
                 trace_delegate.enabled = False
@@ -2730,7 +2812,12 @@ class PyOcdBackend:
                 "default", "hardware", "software", "core", "system", "power-cycle"
             }:
                 raise ValueError(f"unknown reset mode: {mode}")
+            dual_h7 = self._algorithm_reset_done and uses_cm7_flash(
+                (self._connection_arguments or {}).get("target", ""))
             try:
+                if dual_h7 and mode == "core":
+                    raise FlashError(FlashErrorCode.RESET_FAIL,
+                        "STM32H7 dual-core Flash requires system or hardware reset")
                 if self._nrf54l_lock_pending:
                     if mode != "default":
                         raise ValueError("nRF54L15 lock requires CTRL-AP reset")
@@ -2785,7 +2872,10 @@ class PyOcdBackend:
                                 )
                         self._py32f030_unlock_transition_pending = False
                     return
-                if mode == "default":
+                if dual_h7 and mode in {"default", "software", "system"}:
+                    Target = import_pyocd_attr("pyocd.core.target", "Target")
+                    session.target.reset(Target.ResetType.SYSTEM)
+                elif mode == "default":
                     session.target.reset()
                 else:
                     Target = import_pyocd_attr("pyocd.core.target", "Target")
@@ -2808,6 +2898,9 @@ class PyOcdBackend:
                             "Flash operation finished but reset did not start the target "
                             f"(state={state.name}); check the reset connection/method.",
                         )
+                if dual_h7:
+                    finish_system_reset(session.target)
+                    session.options["resume_on_disconnect"] = True
                 if isinstance(trace_delegate, _TraceStateDelegate) and not self._security_family:
                     trace_delegate.enabled = True
             except FlashError:
@@ -3119,6 +3212,7 @@ class PyOcdBackend:
         return self._session
 
     def _close_after_failure(self) -> None:
+        self._erased_ranges = ()
         session, self._session = self._session, None
         if session is not None:
             try:

@@ -173,9 +173,11 @@ python -m mklink rtt --visualize
 
 **解析策略说明：**
 - `kv`（键值对）：自动解析 `name: value | name2: value2` 格式，也支持 `key=value` 格式
-- `csv`：解析逗号/制表符/空格分隔的数值
+- `csv`：解析逗号/制表符/空格分隔的有限十进制数值（支持正负号、科学计数法和括号）；整行须为数值。HEX 日志、混合文本及单位后缀不作为 CSV 曲线数据；带单位的数据可使用 `kv` 或明确的 `regex` 提取。
 - `regex`：使用自定义正则表达式（含 Python 命名分组 `(?P<name>...)`）
 - `auto`（默认）：自动检测前几行输出来选择策略
+
+Web RTT 终端模式只订阅终端文本，不运行收发视图的行/曲线解析；切换到收发模式后才按需解析。各通道及共享窗口按订阅独立处理，切换视图不重启设备采集。无法解析的数值行不影响原始 RTT 文本或后续采集，CLI、MCP 与 Web 共用数值解析规则。
 
 **仪表盘功能：**
 - 实时折线图，每个变量独立曲线
@@ -224,6 +226,8 @@ python -m mklink rtt --visualize --port-http 8888 --no-browser
 ### HPMicro BIN / HEX 下载
 
 HPM SDK 工程会走设备端 `hpm.program()` 下载路径。HPM 型号不使用 FLM，也不需要 Pack；算法发现必须直接返回空。`project-init` 识别到 HPM board 后，会把 `hpm_flash_cfg` 写入 `project_info.json`；手动配置时必须使用 4 个参数：
+
+HPM5301 也可以在脱机界面显式选择 [USART ISP](hpm-usart-isp.md)，由支持该能力的 HPMLINK V4 固件使用独立 UART 执行。该协议使用单独的 NOR 配置，不沿用下述 JTAG 四字参数，也不自动改变现有下载路径。
 
 ```json
 "hpm_flash_cfg": ["0xfcf90002U", "0x00000005U", "0x00001000U", "0xf3000000U"]

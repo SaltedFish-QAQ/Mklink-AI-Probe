@@ -799,7 +799,54 @@ describe('ConfigView', () => {
     expect(wrapper.get('[data-testid="upgrade-firmware"]').attributes('disabled')).toBeUndefined()
     await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
     await flushPromises()
-    expect(mocks.api.upgradeProbeFirmware).toHaveBeenCalledWith(true)
+    expect(mocks.api.upgradeProbeFirmware).toHaveBeenCalledWith(true, undefined)
+  })
+
+  it('shows pending firmware checks and suppresses duplicate checks and upgrades', async () => {
+    const pending = deferred<any>()
+    mocks.api.probeFirmwareCheck.mockReturnValueOnce(pending.promise)
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="check-firmware"]').trigger('click')
+    expect(wrapper.get('[data-testid="firmware-check-status"]').text()).toContain('正在识别')
+    expect(wrapper.get('[data-testid="check-firmware"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="upgrade-firmware"]').attributes('disabled')).toBeDefined()
+    pending.resolve({ status: 'ok', current_version: 'V4.7.1' })
+    await flushPromises()
+    expect(wrapper.get('[data-testid="firmware-check-status"]').text()).toContain('满足要求')
+    expect(wrapper.get('[data-testid="check-firmware"]').attributes('disabled')).toBeUndefined()
+    expect(mocks.api.probeFirmwareCheck).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  it.each(['http', 'skipped'])('shows firmware check failures instead of silently swallowing them (%s)', async failure => {
+    if (failure === 'http') mocks.api.probeFirmwareCheck.mockRejectedValueOnce(new Error('Probe unavailable'))
+    else mocks.api.probeFirmwareCheck.mockResolvedValueOnce({ status: 'skipped', error: 'Probe unavailable' })
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="check-firmware"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="firmware-check-status"]').text()).toContain('Probe unavailable')
+    expect(mocks.toastError).toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('uses an explicit local selection for firmware actions without connecting the target', async () => {
+    sharedRuntime.value = true
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="local-port"]').setValue('TEST_PORT_B')
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="check-firmware"]').trigger('click')
+    await flushPromises()
+    expect(mocks.api.probeFirmwareCheck).toHaveBeenCalledWith('TEST_PORT_B')
+    await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
+    await flushPromises()
+    expect(mocks.api.upgradeProbeFirmware).toHaveBeenCalledWith(true, 'TEST_PORT_B')
+    expect(mocks.api.connectDevice).not.toHaveBeenCalled()
+    // Update verification belongs to the updater; never auto-select another
+    // newly plugged probe in a follow-up check after the firmware reboot.
+    expect(mocks.api.probeFirmwareCheck).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
   })
 
   it('shows the latest version and saves firmware after automatic update fails', async () => {
@@ -856,6 +903,21 @@ describe('ConfigView', () => {
     expect(mocks.api.downloadProbeFirmware).toHaveBeenCalledWith('V2', 'microlink')
   })
 
+  it('retains manual firmware download when no physical probe can be selected', async () => {
+    mocks.api.upgradeProbeFirmware.mockRejectedValueOnce(new Error('未检测到下载器'))
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="firmware-upgrade-status"]').text()).toContain('未检测到下载器')
+    await wrapper.get('[data-testid="firmware-model-choice"]').setValue('v2')
+    await wrapper.get('[data-testid="download-firmware"]').trigger('click')
+    await flushPromises()
+    expect(mocks.api.downloadProbeFirmware).toHaveBeenCalledWith('V2', 'microlink')
+    expect(mocks.api.upgradeProbeFirmware).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
   it('offers explicit firmware model selection when an old probe cannot be identified', async () => {
     mocks.api.upgradeProbeFirmware.mockResolvedValueOnce({ status: 'manual_required', message: '暂时无法识别下载器' })
     const wrapper = await mountView()
@@ -883,6 +945,33 @@ describe('ConfigView', () => {
     expect(wrapper.find('[data-testid="manual-firmware-download"]').exists()).toBe(false)
     expect(mocks.toastSuccess).toHaveBeenCalled()
     expect(mocks.toastError).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('allows checking and reinstalling an unconfirmed same-version repair', async () => {
+    mocks.api.probeFirmwareCheck.mockResolvedValue({
+      status: 'revision_unknown', current_version: 'V4.7.0', current_build_id: null,
+      recommended_uf2: { build_id: '2026-10-24T23:23:05' }, all_uf2s: [], instructions: '',
+    })
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="check-firmware"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="firmware-revision-unknown"]').text()).toContain('尚未确认')
+    expect(wrapper.get('[data-testid="firmware-recommended-build"]').text()).toContain('2026-10-24T23:23:05')
+    expect(wrapper.get('[data-testid="upgrade-firmware"]').attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('does not offer a manual downgrade when the installed build is newer', async () => {
+    mocks.api.upgradeProbeFirmware.mockResolvedValueOnce({ status: 'downgrade_blocked', message: '当前构建更新，已阻止降级。' })
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="firmware-upgrade-status"]').text()).toContain('已阻止降级')
+    expect(wrapper.find('[data-testid="manual-firmware-download"]').exists()).toBe(false)
+    expect(mocks.toastSuccess).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 })

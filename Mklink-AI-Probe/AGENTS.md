@@ -27,6 +27,9 @@ Paths below are relative to the source root containing this file and
 - Canonical development/issue repository is `MicroKeen/Mklink-AI-Probe`, default
   `main`, remote `microkeen`. See `docs/ai/repository-governance.md` for the live
   branch rules and publisher boundary. Existing client update URLs are unchanged.
+- As of 2026-10-25, new GitHub releases, assets, tags and indexes go only to
+  `MicroKeen/Mklink-AI-Probe`; stop legacy Aladdin-Wang GitHub maintenance.
+  Preserve historical releases. Gitee `Aladdin-Wang/Mklink-AI-Probe` remains active.
 - Start each authorized fix/feature from current `microkeen/main` in an isolated
   `codex/<task>` branch/worktree, or continue its existing task branch. Push that
   branch to `microkeen` and submit a PR. Never push directly to `main`.
@@ -82,6 +85,9 @@ Paths below are relative to the source root containing this file and
   explicit choice. HPM uses ROM API, never FLM or a second generic SWD reset.
   VCC changes require confirmation of the specific voltage for each operation.
 - Standard installer output is NSIS. MSI/offline WebView2 needs authorization.
+  Build Windows installers by default. Build Linux/macOS installers or dispatch
+  their native CI only when the user explicitly requests those platforms;
+  generic build, prerelease testing, or release requests do not include them.
   Do not commit firmware, Packs, FLM, screenshots, device identifiers, local
   hardware paths, or secrets without a specific applicable exception.
 - Public Skill packages contain only runtime files. Keep maintainer memory,

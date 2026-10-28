@@ -123,7 +123,7 @@ def test_firmware_recheck_reuses_probe_query_only_when_disk_version_is_unavailab
         raise AssertionError('Firmware recheck attempted an independent CDC connection')
     monkeypatch.setattr(fc, 'read_device_version', forbidden)
     response = client.get('/api/probe/firmware-check')
-    assert response.status_code == 200 and response.json()['status'] == 'ok', response.text
+    assert response.status_code == 200 and response.json()['status'] == 'revision_unknown', response.text
     assert response.json()['current_version'] == 'V4.5.2'
     assert bridge.commands == ([] if disk_version else ['cmd.get_version()'])
     assert not control.sessions and not state['resource_manager'].get_status()
@@ -373,6 +373,45 @@ def test_hpm_inspection_uses_rom_without_flm_and_idcode_is_optional(monkeypatch)
     result = inspect_mcu(device='HPM6E80', port='COM9', read_idcode=True)
     assert result['idcode'] == 0x1000563d
     assert calls == [('probe_idcode', {'port': 'COM9'})]
+
+
+@pytest.mark.parametrize('query', ['part', 'aRt1', 'PART*', 'partxx', 'Part??'])
+def test_mcu_inspection_searches_fragments_and_wildcards_without_selecting_or_writing(tmp_path, monkeypatch, query):
+    from mklink.mcu_detect import inspect_mcu
+    from mklink.cmsis_dap.pack_catalog import PackCatalog
+    from mklink.cmsis_dap.paths import PackPaths
+    from mklink.cmsis_dap.models import TargetRecord
+    from mklink.cmsis_dap.algorithm_catalog import FlashAlgorithm
+
+    records = [TargetRecord('PART12', 'Vendor A', installed=True, source='daplink-builtin'),
+               TargetRecord('PART13', 'Vendor B', installed=True, source='installed'),
+               TargetRecord('OTHER12', 'Vendor A', installed=True, source='builtin')]
+    paths = PackPaths(tmp_path / 'packs')
+    catalog = PackCatalog(paths, builtin_provider=lambda: records)
+    monkeypatch.setattr('mklink.cmsis_dap.pack_catalog.PackCatalog', lambda received: catalog)
+    def algorithms(target, **kwargs):
+        assert kwargs['paths'] is paths
+        if target not in {'PART12', 'PART13'}:
+            return []
+        size = 65536 if target == 'PART12' else 131072
+        return [FlashAlgorithm(target, target, 'shared.FLM', 0x08000000, size,
+                               0x20000000, 8192, True, 'installed-pack', 'Example', target,
+                               page_size=256, sector_sizes=((0, 1024),))]
+    monkeypatch.setattr('mklink.cmsis_dap.algorithm_catalog.discover_flash_algorithms', algorithms)
+    monkeypatch.setattr('mklink.runtime.query_probe', lambda *a, **k: pytest.fail('Search opened hardware'))
+    result = inspect_mcu(device=query, paths=paths)
+    assert result['status'] == 'matches'
+    assert result['target_candidates'] == ['PART12', 'PART13']
+    assert [m['candidates'][0]['size'] for m in result['target_matches']] == [65536, 131072]
+    assert result['candidates'] == [] and 'selected_algorithm' not in result
+    assert not list(tmp_path.iterdir())
+
+
+def test_mcu_search_requires_a_literal_fragment(monkeypatch):
+    from mklink.mcu_detect import inspect_mcu
+    monkeypatch.setattr('mklink.cmsis_dap.algorithm_catalog.discover_flash_algorithms', lambda *a, **k: [])
+    monkeypatch.setattr('mklink.cmsis_dap.pack_catalog.PackCatalog', lambda *a, **k: pytest.fail('Unbounded search'))
+    assert inspect_mcu(device='*?xx')['status'] == 'unsupported'
 
 
 @pytest.mark.parametrize('field', ['write_profile', 'copy_flm', 'profiles_path'])

@@ -91,9 +91,9 @@ describe('App version footer', () => {
     const wrapper = mountApp()
 
     expect(wrapper.get('.app-title').text()).toBe('MKLink')
-    expect(wrapper.findAll('.nav-tab').map(tab => tab.text())).toEqual(['配置', '仪表盘', '脱机烧录', '在线烧录', '远程服务'])
+    expect(wrapper.findAll('.nav-tab').map(tab => tab.text())).toEqual(['配置', '仪表盘', '在线烧录', '脱机烧录', '远程服务'])
     await wrapper.get('[data-testid="global-language-toggle"]').trigger('click')
-    expect(wrapper.findAll('.nav-tab').map(tab => tab.text())).toEqual(['Config', 'Dashboard', 'Offline Flash', 'Online Flash', 'Remote Service'])
+    expect(wrapper.findAll('.nav-tab').map(tab => tab.text())).toEqual(['Config', 'Dashboard', 'Online Flash', 'Offline Flash', 'Remote Service'])
     expect(wrapper.get('[data-testid="global-language-toggle"]').text()).toContain('中文')
     wrapper.unmount()
   })
@@ -127,14 +127,14 @@ describe('App version footer', () => {
     wrapper.unmount()
   })
 
-  it('exposes documentation and the ordered store menu without showing raw URLs', () => {
+  it('exposes the official website and ordered store menu without showing raw URLs', () => {
     const wrapper = mountApp()
-    const docs = wrapper.get('[data-testid="online-docs-link"]')
+    const website = wrapper.get('[data-testid="official-website-link"]')
     const store = wrapper.get('[data-testid="taobao-link"]')
     const official = wrapper.get('[data-testid="official-store-link"]')
     const xianji = wrapper.get('[data-testid="xianji-store-link"]')
-    expect(docs.attributes()).toMatchObject({
-      href: 'https://microboot.readthedocs.io/zh-cn/latest/tools/microlink/microlink/',
+    expect(website.attributes()).toMatchObject({
+      href: 'https://microkeenai.com/',
       target: '_blank',
       rel: 'noopener noreferrer',
     })
@@ -148,12 +148,12 @@ describe('App version footer', () => {
       target: '_blank',
       rel: 'noopener noreferrer',
     })
-    expect(docs.text()).toBe('在线文档')
+    expect(website.text()).toBe('官方网站')
     expect(store.text()).toBe('淘宝店铺')
     expect(official.text()).toBe('官方智沐店铺')
     expect(xianji.text()).toBe('先楫定制店铺')
     expect(xianji.attributes('disabled')).toBeUndefined()
-    expect(wrapper.text()).not.toContain('microboot.readthedocs.io')
+    expect(wrapper.text()).not.toContain('https://microkeenai.com/')
     expect(wrapper.text()).not.toContain('item.taobao.com')
     wrapper.unmount()
   })
@@ -166,12 +166,11 @@ describe('App version footer', () => {
     wrapper.unmount()
   })
 
-  it('shows the stable release and source build in the lower right', () => {
+  it('shows the compact stable release in the lower right', () => {
     const wrapper = mountApp()
 
     expect(wrapper.getComponent(VersionHistoryPopover).props()).toEqual({
       version: __APP_VERSION__,
-      buildCommit: expect.stringMatching(/^[0-9a-f]{7,}$/),
     })
     wrapper.unmount()
   })

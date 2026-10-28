@@ -30,6 +30,15 @@ Tauri/Rust executable
 
 Development builds may fall back to a Python backend. Release installers must contain `mklink-sidecar.exe`, and the Rust launcher must prefer that bundled sidecar.
 
+Windows uses PyInstaller `onedir`: NSIS installs the executable and its complete
+`_internal` dependency directory together. Both the proxy and independent runtime
+load these installed files directly, avoiding two full extractions per launch.
+Never distribute the executable alone. Unix packaging retains its existing
+`onefile` layout. Windows qualification must compare the entire `_internal`
+tree as well as the executables, and verify startup and normal shutdown with
+only Windows directories on PATH. Keep the existing process ownership and
+installer file-in-use checks; do not reuse another process's temporary files.
+
 The 0.2.0 release sidecar and public Skill ZIP must contain the repository-local
 algorithm assets under `_maintainer/local/builtin_flm`. This directory is
 ignored by Git and is the single local source for both packages. The builder
@@ -67,6 +76,11 @@ These paths are relative to the main checkout, shared across worktrees.
 
 ### Native macOS / Linux candidates
 
+These platforms are opt-in. Build Windows NSIS by default; do not build Linux
+or macOS installers or dispatch their workflow unless the user explicitly
+requests those platforms. General build, prerelease testing, and publication
+requests do not imply that request. `desktop-unix.yml` is manual-dispatch only.
+
 Run `scripts/build_workspace.ps1` with `python` and argument
 `skills/tauri-gui-builder/scripts/build_unix.py` on the target OS/architecture.
 The `desktop-unix.yml` workflow builds Apple Silicon and Intel DMGs and Linux
@@ -85,7 +99,7 @@ Native candidates also contain updater payloads: macOS `.app.tar.gz`, Linux
 AppImage and DEB. `build-manifest.json` declares `darwin-aarch64`,
 `darwin-x86_64`, `linux-x86_64-appimage`, and `linux-x86_64-deb` keys. Candidates
 remain unsigned. Once publication/signing is explicitly authorized, sign each
-payload with the existing Tauri updater key and pass all three build manifests
+requested platform's payload with the existing Tauri updater key and pass its build manifest
 to `prepare_release.py --desktop-manifest ...` (repeat for each target). The
 preparer requires matching source/version, hashes, and nonempty adjacent `.sig`
 files. The publisher validates and includes these platform entries in both
